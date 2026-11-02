@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- The v0.2.0 section below counts eighteen defects, not sixteen: two of them were
+  found by the three-OS CI after the release notes had been generated, and a count
+  that is wrong is worse than no count.
 
 ## [0.2.0] - 2026-11-02
 
@@ -55,7 +59,10 @@ Nothing yet.
 
 ### Fixed
 
-- Sixteen defects found by review and by independent verification, in two rounds.
+- Eighteen defects: sixteen found by review and by independent verification in two
+  rounds, and two that only a three-OS CI could see - a directory timestamp folded
+  into the tree's identity, and Windows 8.3 short names giving one directory two
+  spellings in a report.
   The ones worth naming: a relink that trusted size and mtime silently published
   stale bytes; a symlinked directory inside an older snapshot could pull content
   from outside the configured root into a new one; publishing had no durability, so
