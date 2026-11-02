@@ -109,9 +109,13 @@ tasks:
   #
   # The file must be an absolute path to a regular file you wrote: cronkite never
   # downloads or generates a script. It receives CRONKITE_RUN_ID, CRONKITE_MODE,
-  # CRONKITE_DRY_RUN and CRONKITE_TASK, and it must honour CRONKITE_DRY_RUN=1 by
-  # describing what it would do without changing anything. A non-zero exit is
-  # recorded as a task failure and the run continues with the next task.
+  # CRONKITE_DRY_RUN and CRONKITE_TASK.
+  #
+  # `cronkite plan` RUNS the script with CRONKITE_DRY_RUN=1 and records what it
+  # printed, because the only honest preview of a script is its own. A script that
+  # ignores that variable can change things during a rehearsal. `cronkite run
+  # --apply` runs it once with CRONKITE_DRY_RUN=0; a non-zero exit is recorded as a
+  # task failure and the run continues with the next task.
   #
   # See examples/maintenance.sh and examples/maintenance.ps1.
   # - name: rotate

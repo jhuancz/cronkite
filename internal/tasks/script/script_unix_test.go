@@ -5,6 +5,7 @@ package script
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -74,24 +75,69 @@ func requireNoFile(t *testing.T, path, why string) {
 	}
 }
 
-// A rehearsal is not a licence to run the script: plan mode reports the command
-// line and executes nothing.
-func TestPlanRunsNothing(t *testing.T) {
+// A rehearsal is the script's own preview: plan mode runs it with
+// CRONKITE_DRY_RUN=1 and records what it said. A script that honours the variable
+// changes nothing, which is what makes the preview trustworthy.
+func TestPlanRehearsesWithDryRun(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
-	tk := newTask(t, scriptConfig(t, "maint", "echo ran > "+marker+"\necho planned\n"))
+	out := filepath.Join(t.TempDir(), "env.txt")
+	body := fmt.Sprintf(`if [ "$CRONKITE_DRY_RUN" = "1" ]; then
+  echo "would touch nothing"
+else
+  echo touched > %q
+fi
+printf '%%s\n' "$CRONKITE_DRY_RUN" "$CRONKITE_MODE" > %q
+`, marker, out)
+	tk := newTask(t, scriptConfig(t, "maint", body))
 
 	p := plan(t, tk, report.ModePlan)
 
-	requireNoFile(t, marker, "plan mode ran the script")
+	requireNoFile(t, marker, "a script that honours CRONKITE_DRY_RUN changed something")
+	joined := notes(p.Notes)
+	for _, want := range []string{"would touch nothing", "DRY_RUN=1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("plan notes should carry %q, got:\n%s", want, joined)
+		}
+	}
 	if len(p.Actions) != 0 {
 		t.Errorf("plan actions = %v, want none: a script's changes are its own", p.Actions)
 	}
-	joined := notes(p.Notes)
-	for _, want := range []string{"bash", tk.file, "timeout"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("plan notes should mention %q, got:\n%s", want, joined)
-		}
+	// The script really ran and reported its own rehearsal mode.
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("the rehearsal did not run: %v", err)
 	}
+	if got := strings.TrimSpace(string(raw)); got != "1\nplan" {
+		t.Errorf("script saw dry_run/mode = %q, want \"1\\nplan\"", got)
+	}
+}
+
+// The documented cost of a rehearsed plan: a script that ignores
+// CRONKITE_DRY_RUN can change things during a rehearsal. Pinning it here keeps the
+// contract honest instead of pretending cronkite can enforce what it cannot.
+func TestPlanRunsAScriptThatIgnoresTheDryRun(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	tk := newTask(t, scriptConfig(t, "maint", "echo ran > "+marker+"\n"))
+
+	p := plan(t, tk, report.ModePlan)
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("a script that ignores CRONKITE_DRY_RUN is expected to run during a rehearsal: %v", err)
+	}
+	if !strings.Contains(notes(p.Notes), "ran /") {
+		t.Errorf("the rehearsal output should still be recorded, got:\n%s", notes(p.Notes))
+	}
+}
+
+// Apply mode must not rehearse: the engine plans and then applies, so executing in
+// both phases would run the script twice.
+func TestApplyPhaseDoesNotExecute(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	tk := newTask(t, scriptConfig(t, "maint", "echo ran >> "+marker+"\n"))
+
+	plan(t, tk, report.ModeApply)
+
+	requireNoFile(t, marker, "the apply-phase plan executed the script")
 }
 
 // A script that exits 0 is an ok task, and its output is in the report instead

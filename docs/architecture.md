@@ -127,11 +127,12 @@ implement:
 | Interpreter | `bash`, `sh` or `powershell`, resolved from `PATH` when the task is built, so a missing interpreter fails at start-up rather than at 03:00. |
 | File | An absolute path to a regular file the operator named. cronkite never downloads or generates a script. |
 | Environment | `CRONKITE_RUN_ID` (the id of the report this run writes, so a script's own log can be matched against it), `CRONKITE_MODE` (`plan`/`apply`), `CRONKITE_DRY_RUN` (`1`/`0`), `CRONKITE_TASK`. The inherited environment is passed through. |
-| Dry run | The script must honour `CRONKITE_DRY_RUN=1` and describe its intent without mutating. A rehearsal executes nothing, so this is the only thing that makes plan mode meaningful for a script. |
+| Dry run | A rehearsal **runs the script** with `CRONKITE_DRY_RUN=1` and records its output, because the only honest preview of an opaque script is the script's own. That makes the contract real: a script that ignores the variable can change things during a rehearsal, which is why the samples and this document state it. |
 | Exit code | `0` is success; anything else is a task failure carrying the status and the tail of the output. The run continues with the next task, exactly as a failed deletion does. |
 | Timeout | `timeout` on the task, 5m by default. Exceeding it kills the **process group**, not the direct child, so work the script spawned cannot outlive the run. On platforms without process groups only the direct child is killed, and the report says the task timed out. |
 | Output | stdout and stderr are captured into the task's notes, capped at 8 KiB per stream with an explicit truncation note. Output is never printed to the terminal verbatim: the report is where it belongs. |
 | Actions | None. cronkite did not measure any file change, so the report records a script through its notes and failures rather than inventing work in the totals. |
+| Phases | `Plan` rehearses (dry run), `Apply` executes once. Apply mode does not rehearse, because the engine plans and then applies and the script would run twice. |
 
 Scripts appear in the same report as native tasks, which is the point: one run,
 one audit trail, one place to look after something went wrong.

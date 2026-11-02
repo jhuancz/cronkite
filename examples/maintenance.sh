@@ -12,7 +12,8 @@
 #   CRONKITE_TASK     the task name from the configuration
 #
 # Two rules make a script safe to schedule:
-#   - honour CRONKITE_DRY_RUN; a rehearsal that deletes something is a bug
+#   - honour CRONKITE_DRY_RUN: cronkite RUNS this file during a rehearsal with
+#     it set to 1, so a script that ignores it deletes things in plan mode
 #   - exit non-zero when something went wrong; cronkite records the status and
 #     keeps going with the next task, which is better than dying quietly
 #

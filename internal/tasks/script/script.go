@@ -140,17 +140,19 @@ func (t *Task) Type() string { return config.TypeScript }
 // Close implements task.Runner. A script task holds nothing open between phases.
 func (t *Task) Close() error { return nil }
 
-// Plan reports what a run would execute and changes nothing.
+// Plan rehearses the script instead of describing it.
 //
-// The script is not run, not even with CRONKITE_DRY_RUN=1: a rehearsal that ran
-// it would be trusting every script on the machine to behave. What the plan
-// carries is the exact command line Apply will use, the timeout that bounds it,
-// and the environment it will see, so an operator can check the rehearsal agrees
-// with the run.
+// A script is opaque: cronkite cannot know what it touches, so the only honest
+// preview is the script's own. A rehearsal therefore executes it with
+// CRONKITE_DRY_RUN=1 and records what it said, because the alternative - printing
+// the command line and claiming nothing will happen - would make a destructive
+// script look safe in plan mode. It runs only during a rehearsal: the engine plans
+// and then applies, so executing here in apply mode would run the script twice.
 //
-// There is one deliberate absence: no actions. cronkite cannot know which files a
-// script will touch, and a plan that invented them would offer a preview of work
-// nobody measured.
+// The corollary is the contract: a script that ignores CRONKITE_DRY_RUN can change
+// things during a rehearsal. That is why the variable exists and why the example
+// scripts, the architecture document and the configuration reference all state it.
+// Nothing is reported as planned work either way: the script decides what it does.
 func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -164,20 +166,31 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 		"would run: "+t.commandLine(),
 		fmt.Sprintf("timeout %s: exceeding it kills the process group, so nothing the script started outlives the run", t.timeout),
 		"environment: "+strings.Join(t.environ(env), " "),
-		"no actions are planned: the script decides what it touches, and its output is recorded in this task's notes",
 	)
+	// Only a rehearsal executes. The engine plans and then applies, so running the
+	// script here in apply mode would run it twice.
+	if env.Mode == report.ModePlan {
+		notes, failure := t.execute(ctx, env)
+		plan.Notes = append(plan.Notes, notes...)
+		if failure != nil {
+			// A rehearsal that cannot finish is worth failing for: the operator
+			// asked what would happen and the answer is "it breaks".
+			return plan, fmt.Errorf("task %s: rehearsal failed: %w", t.name, failure.Err)
+		}
+		plan.Notes = append(plan.Notes, "the rehearsal measured no change of its own: the script decides what it touches")
+	}
 	return plan, nil
 }
 
 // Apply runs the script once and reports what happened.
 //
-// A non-zero exit and a timeout are task failures, not errors: the run
-// continues with the next task, exactly as a failed deletion does, and the
-// report says which task failed and why.
+// A non-zero exit and a timeout are task failures, not errors: the run continues
+// with the next task, exactly as a failed deletion does, and the report says which
+// task failed and why.
 //
-// The output and the summary are recorded in result.Notes, which the engine
-// merges into the report next to the plan's notes: the script produced no
-// actions, so its output is the only evidence of what it did.
+// The output and the summary are recorded in result.Notes, which the engine merges
+// into the report next to the plan's notes: the script produced no actions, so its
+// output is the only evidence of what it did.
 //
 // Nothing is reported as done work: cronkite measured no file change, so
 // result.Done stays empty in both directions and the report shows the script
@@ -193,6 +206,21 @@ func (t *Task) Apply(ctx context.Context, plan *task.Plan, env task.Env) (*task.
 		return res, err
 	}
 
+	notes, failure := t.execute(ctx, env)
+	res.Notes = append(res.Notes, notes...)
+	if failure != nil {
+		res.Failed = append(res.Failed, *failure)
+	}
+	return res, nil
+}
+
+// execute runs the script once under the timeout and returns what it printed,
+// followed by a failure when it did not finish cleanly.
+//
+// It is shared by the rehearsal and the run so the two cannot drift: both send the
+// same environment, apply the same timeout and kill the same process group. Only
+// CRONKITE_DRY_RUN differs, and env carries the mode that decides it.
+func (t *Task) execute(ctx context.Context, env task.Env) ([]string, *task.Failure) {
 	stdout := &capture{limit: maxOutputBytes}
 	stderr := &capture{limit: maxOutputBytes}
 
@@ -215,31 +243,24 @@ func (t *Task) Apply(ctx context.Context, plan *task.Plan, env task.Env) (*task.
 
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
-		res.Failed = append(res.Failed, task.Failure{Path: t.file, Err: fmt.Errorf("start %s: %w", t.interpreterPath, err)})
-		return res, nil
+		return nil, &task.Failure{Path: t.file, Err: fmt.Errorf("start %s: %w", t.interpreterPath, err)}
 	}
 	waitErr := cmd.Wait()
 	elapsed := time.Since(started)
 
 	// The output goes into the report whatever happened: it is the only record of
 	// what the script did, and it is never printed to the terminal verbatim.
-	res.Notes = append(res.Notes, outputNotes(stdout, stderr)...)
-	res.Notes = append(res.Notes, fmt.Sprintf("ran %s in %s", t.commandLine(), elapsed.Round(time.Millisecond)))
+	notes := outputNotes(stdout, stderr)
+	notes = append(notes, fmt.Sprintf("ran %s in %s", t.commandLine(), elapsed.Round(time.Millisecond)))
 
-	if err := ctx.Err(); err != nil {
-		// The run itself was interrupted. That is not the script's failure and is
-		// reported as an interrupted run, the same way every other task does it.
-		return res, fmt.Errorf("task %s: %w", t.name, err)
-	}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		res.Failed = append(res.Failed, task.Failure{Path: t.file, Err: fmt.Errorf(
-			"timed out after %s: the process group was killed%s", t.timeout, tailSuffix(stdout, stderr))})
-		return res, nil
+		return notes, &task.Failure{Path: t.file, Err: fmt.Errorf(
+			"timed out after %s: the process group was killed%s", t.timeout, tailSuffix(stdout, stderr))}
 	}
 	if waitErr != nil {
-		res.Failed = append(res.Failed, task.Failure{Path: t.file, Err: exitFailure(waitErr, stdout, stderr)})
+		return notes, &task.Failure{Path: t.file, Err: exitFailure(waitErr, stdout, stderr)}
 	}
-	return res, nil
+	return notes, nil
 }
 
 // checkFile validates the trust rule of this task type: the script is a file the
