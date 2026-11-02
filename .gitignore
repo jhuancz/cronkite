@@ -1,0 +1,18 @@
+# Build output
+/cronkite
+/cronkite.exe
+/dist/
+
+# Local operator configuration and secrets. Never commit these.
+/cronkite.conf
+*.local.conf
+.env
+
+# Working notes: ODD feature documents and agent tooling stay out of the
+# published repository, which has to read as a tool, not a course project.
+/odd/
+/.atl/
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,72 @@
+# cronkite configuration reference.
+#
+# Copy to /etc/cronkite/cronkite.conf (or ~/.config/cronkite/cronkite.conf) and
+# edit. Secrets NEVER belong in this file: they are read from the environment
+# variables named here.
+
+version: 1
+
+run:
+  # Where cronkite keeps state: locks, reports, the last-run summary.
+  # Defaults to the platform state directory for the current user.
+  state_dir: ""
+
+  # Any operator-supplied paths are expanded ($VAR, ${VAR} and %VAR%).
+  lock_file: ""          # default: <state_dir>/cronkite.lock
+  timeout: "30m"         # whole-run deadline
+
+  safety:
+    # Hard ceilings for a single run. Exceeding either one aborts the run with
+    # exit code 4 instead of deleting. This is what stops a typo from wiping a
+    # filesystem; use --force to override deliberately.
+    max_delete_files: 500
+    max_delete_bytes: "5GiB"
+
+report:
+  dir: ""                # default: <state_dir>/reports
+  # Individual delete actions stored per task in the JSON report. Counters are
+  # always complete; only the action list is capped.
+  max_actions_per_task: 1000
+
+notify:
+  # Implemented in v0.2.0. Kept in the schema so configurations stay forward
+  # compatible.
+  enabled: false
+  on: [failure, partial]
+  throttle: "15m"
+  telegram:
+    chat_id: ""
+    token_env: "CRONKITE_TELEGRAM_TOKEN"
+
+tasks:
+  - name: logs
+    type: logclean
+    roots:
+      - /var/log
+      - ${HOME}/.local/state/logs
+    older_than: 30d
+    max_depth: 4
+    remove_empty_dirs: true
+    protect:
+      # Patterns without a separator match the file name; patterns with one
+      # match the full path or any trailing part of it, so "cronkite/*" covers
+      # /var/log/cronkite today and /srv/apps/cronkite tomorrow. Protecting a
+      # directory protects its whole subtree. Both use filepath.Match syntax.
+      - "*.journal"
+      - "cronkite/*"
+      - "wtmp"
+      - "btmp"
+      - "lastlog"
+
+  - name: temp
+    type: tempclean
+    roots:
+      - /tmp
+      - /var/tmp
+      - "%TEMP%"
+    older_than: 7d
+    max_depth: 8
+    remove_empty_dirs: true
+    protect:
+      - ".X11-unix"
+      - "systemd-private-*"
