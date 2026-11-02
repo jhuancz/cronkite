@@ -330,3 +330,32 @@ func TestNewResolvesTheInterpreter(t *testing.T) {
 		}
 	})
 }
+
+// A cancelled run is not the script's failure. The validator found this
+// regression in the correction that moved execution into a shared helper: the
+// interruption check has to survive the refactor, or stopping a run blames a
+// script that was killed with it.
+func TestApplyPropagatesCancellationInsteadOfBlamingTheScript(t *testing.T) {
+	tk := newTask(t, scriptConfig(t, "maint", "sleep 5\n"))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	res, err := tk.Apply(ctx, &task.Plan{}, envFor(report.ModeApply))
+	<-done
+
+	if err == nil {
+		t.Fatalf("a cancelled run must return an error, got result %+v", res)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+	if len(res.Failed) != 0 {
+		t.Errorf("failures = %v, want none: the script was killed, it did not fail", res.Failed)
+	}
+}

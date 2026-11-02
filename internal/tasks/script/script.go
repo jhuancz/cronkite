@@ -170,8 +170,11 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 	// Only a rehearsal executes. The engine plans and then applies, so running the
 	// script here in apply mode would run it twice.
 	if env.Mode == report.ModePlan {
-		notes, failure := t.execute(ctx, env)
+		notes, failure, err := t.execute(ctx, env)
 		plan.Notes = append(plan.Notes, notes...)
+		if err != nil {
+			return plan, err
+		}
 		if failure != nil {
 			// A rehearsal that cannot finish is worth failing for: the operator
 			// asked what would happen and the answer is "it breaks".
@@ -206,8 +209,11 @@ func (t *Task) Apply(ctx context.Context, plan *task.Plan, env task.Env) (*task.
 		return res, err
 	}
 
-	notes, failure := t.execute(ctx, env)
+	notes, failure, err := t.execute(ctx, env)
 	res.Notes = append(res.Notes, notes...)
+	if err != nil {
+		return res, err
+	}
 	if failure != nil {
 		res.Failed = append(res.Failed, *failure)
 	}
@@ -220,7 +226,7 @@ func (t *Task) Apply(ctx context.Context, plan *task.Plan, env task.Env) (*task.
 // It is shared by the rehearsal and the run so the two cannot drift: both send the
 // same environment, apply the same timeout and kill the same process group. Only
 // CRONKITE_DRY_RUN differs, and env carries the mode that decides it.
-func (t *Task) execute(ctx context.Context, env task.Env) ([]string, *task.Failure) {
+func (t *Task) execute(ctx context.Context, env task.Env) ([]string, *task.Failure, error) {
 	stdout := &capture{limit: maxOutputBytes}
 	stderr := &capture{limit: maxOutputBytes}
 
@@ -243,7 +249,7 @@ func (t *Task) execute(ctx context.Context, env task.Env) ([]string, *task.Failu
 
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
-		return nil, &task.Failure{Path: t.file, Err: fmt.Errorf("start %s: %w", t.interpreterPath, err)}
+		return nil, &task.Failure{Path: t.file, Err: fmt.Errorf("start %s: %w", t.interpreterPath, err)}, nil
 	}
 	waitErr := cmd.Wait()
 	elapsed := time.Since(started)
@@ -253,14 +259,21 @@ func (t *Task) execute(ctx context.Context, env task.Env) ([]string, *task.Failu
 	notes := outputNotes(stdout, stderr)
 	notes = append(notes, fmt.Sprintf("ran %s in %s", t.commandLine(), elapsed.Round(time.Millisecond)))
 
+	// The run itself being interrupted is not the script's failure: the operator
+	// stopped the run, and the report has to say that rather than blame a script
+	// that was killed with it. Checked before the exit status, because a killed
+	// process always looks like a failure.
+	if err := ctx.Err(); err != nil {
+		return notes, nil, fmt.Errorf("task %s: %w", t.name, err)
+	}
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return notes, &task.Failure{Path: t.file, Err: fmt.Errorf(
-			"timed out after %s: the process group was killed%s", t.timeout, tailSuffix(stdout, stderr))}
+			"timed out after %s: the process group was killed%s", t.timeout, tailSuffix(stdout, stderr))}, nil
 	}
 	if waitErr != nil {
-		return notes, &task.Failure{Path: t.file, Err: exitFailure(waitErr, stdout, stderr)}
+		return notes, &task.Failure{Path: t.file, Err: exitFailure(waitErr, stdout, stderr)}, nil
 	}
-	return notes, nil
+	return notes, nil, nil
 }
 
 // checkFile validates the trust rule of this task type: the script is a file the
