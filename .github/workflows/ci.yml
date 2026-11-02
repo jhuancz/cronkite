@@ -44,3 +44,21 @@ jobs:
 
       - name: test
         run: go test -race ./...
+
+  scripts:
+    name: shell layer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The installers and the cron wrapper are part of the product: an operator
+      # runs them as root on a machine that deletes files.
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: they parse
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done

@@ -137,6 +137,27 @@ implement:
 Scripts appear in the same report as native tasks, which is the point: one run,
 one audit trail, one place to look after something went wrong.
 
+## Notifier
+
+Alerts are an outcome, not an activity log. `notify.on` decides what is worth a
+message (`never`, `failure`, `partial`, `always`), a state file in the state
+directory throttles repeats inside `notify.throttle`, and an escalation is never
+throttled: silence during a new failure is the one thing an alert must not do.
+
+Three invariants make it safe to enable:
+
+- **It cannot change a run.** A Telegram outage, a wrong chat id or an expired
+  token becomes a note in the report; the run's status and exit code keep
+  describing the maintenance.
+- **A rehearsal never sends.** Running `plan` must not post to a team channel.
+- **The token only lives in the environment** variable the configuration names
+  (`notify.telegram.token_env`), and it is redacted from every error, because an
+  error message is the usual way a secret escapes.
+
+Severity follows the documented exit codes: a locked run (exit 3) is silent, a
+refused run (exit 4) alerts, and `failure` in the configuration means
+partial-or-worse, because a run whose tasks failed is reported as `partial`.
+
 ## Report schema versioning
 
 `schema` is bumped only for removals or meaning changes. Additive fields do not

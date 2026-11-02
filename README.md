@@ -116,6 +116,10 @@ Schedule it. cron on Linux:
 30 3 * * * /usr/local/bin/cronkite run --apply >> /var/log/cronkite/cron.log 2>&1
 ```
 
+The wrapper scripts map a locked run to success, so an overlap does not look like
+an incident. Full instructions, including systemd timers and Task Scheduler:
+[docs/scheduling.md](docs/scheduling.md).
+
 Task Scheduler on Windows:
 
 ```powershell
