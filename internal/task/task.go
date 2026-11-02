@@ -8,11 +8,22 @@ package task
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jhuancz/cronkite/internal/report"
 )
+
+// ErrCeiling marks a plan that crosses a ceiling the task itself enforces, such
+// as how many bytes a backup may copy.
+//
+// It is a contract signal, not operator-facing text. The engine turns a plan
+// carrying it into a refused run (exit code 4) rather than an ordinary task
+// failure (exit code 2), because nothing is broken and nothing was written: an
+// operator has a setting to raise or a scope to narrow. It lives here so the
+// engine can recognise it without importing any task implementation.
+var ErrCeiling = errors.New("ceiling exceeded")
 
 // Env is the immutable context handed to every task.
 type Env struct {

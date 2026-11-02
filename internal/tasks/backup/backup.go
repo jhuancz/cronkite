@@ -46,8 +46,12 @@ type Task struct {
 	// not charged against it: they cost no disk, so counting them would refuse
 	// the incremental run this task exists to take.
 	maxBytes int64
-	guard    *fsx.Guard
-	writer   *snapshot.Writer
+	// force bypasses maxBytes for this run, the way run.safety is bypassed for
+	// deletions. It is never silent: a plan that exceeds the ceiling records the
+	// bypass in its notes.
+	force  bool
+	guard  *fsx.Guard
+	writer *snapshot.Writer
 }
 
 // New validates the task configuration, opens its source root and prepares the
@@ -119,6 +123,13 @@ func (t *Task) Name() string { return t.name }
 
 // Type implements task.Runner.
 func (t *Task) Type() string { return config.TypeBackup }
+
+// SetForce records whether this run bypasses the safety ceilings.
+//
+// The engine passes --force to every task that owns a ceiling of its own, the
+// same way it bypasses run.safety for deletions. A task without a ceiling has
+// nothing to bypass and does not implement the hook.
+func (t *Task) SetForce(force bool) { t.force = force }
 
 // Close releases the source handles.
 func (t *Task) Close() error {
@@ -193,6 +204,15 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 			len(rehearsal.Skipped)))
 	}
 
+	// A bypass is recorded wherever it happens, exactly like the run.safety
+	// ceilings: an operator reading the report must be able to see that the limit
+	// was not enforced for this run, and by how much it was missed.
+	if t.force && rehearsal.BytesCopied > t.maxBytes {
+		plan.Notes = append(plan.Notes, fmt.Sprintf(
+			"max_backup_bytes (%s) bypassed by --force: this plan would copy %s; the run is not limited by the ceiling",
+			bytesx.Format(t.maxBytes), bytesx.Format(rehearsal.BytesCopied)))
+	}
+
 	// The ceiling is checked here so a rehearsal refuses instead of letting an
 	// operator discover it from a run that wrote nothing.
 	if err := t.checkCeiling(rehearsal.BytesCopied); err != nil {
@@ -205,14 +225,16 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 //
 // The message names the three things an operator needs to decide what to do:
 // what the plan would copy, what the ceiling is, and which setting changes the
-// outcome.
+// outcome. The error wraps ErrCeiling so the run is refused rather than failed:
+// no configuration is broken and nothing was written, so this is a decision for
+// a human and not a fault to retry.
 func (t *Task) checkCeiling(bytesToCopy int64) error {
-	if bytesToCopy <= t.maxBytes {
+	if t.force || bytesToCopy <= t.maxBytes {
 		return nil
 	}
 	return fmt.Errorf(
-		"task %s: the plan would copy %s into %s, above max_backup_bytes (%s); nothing was written. Raise max_backup_bytes to cover this copy, or narrow roots so one snapshot is smaller",
-		t.name, bytesx.Format(bytesToCopy), t.dest, bytesx.Format(t.maxBytes),
+		"%w: task %s: the plan would copy %s into %s, above max_backup_bytes (%s); nothing was written. Raise max_backup_bytes to cover this copy, or narrow roots so one snapshot is smaller",
+		task.ErrCeiling, t.name, bytesx.Format(bytesToCopy), t.dest, bytesx.Format(t.maxBytes),
 	)
 }
 

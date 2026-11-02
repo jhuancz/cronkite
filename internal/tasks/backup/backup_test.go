@@ -213,6 +213,72 @@ func assertPlanMatchesResult(t *testing.T, plan *task.Plan, res *task.Result) {
 	}
 }
 
+// A ceiling breach is a typed signal, not only a message: the engine has to tell
+// a refusal apart from an ordinary task failure to give the run the exit code an
+// operator acts on. The message still names the plan size, the ceiling and what
+// to change.
+func TestCeilingRefusalIsATypedSignal(t *testing.T) {
+	cfg, _, dest := backupConfig(t)
+	cfg.MaxBackupBytes = "10B" // the source tree holds 20 B
+	tk := newTask(t, cfg)
+
+	_, err := tk.Plan(context.Background(), task.Env{Mode: report.ModePlan, Now: day(1)})
+	if !errors.Is(err, task.ErrCeiling) {
+		t.Fatalf("Plan error = %v, want one carrying ErrCeiling", err)
+	}
+	for _, want := range []string{"20 B", "10 B", "max_backup_bytes", "nothing was written", "Raise"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should mention %q, got: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("a refused plan must not create the destination, stat err = %v", statErr)
+	}
+}
+
+// --force bypasses the task's own ceiling the way it bypasses run.safety, and the
+// bypass is recorded in the report instead of being silent.
+func TestForceBypassesTheCeilingAndRecordsIt(t *testing.T) {
+	cfg, _, dest := backupConfig(t)
+	cfg.MaxBackupBytes = "10B"
+	tk := newTask(t, cfg)
+	tk.SetForce(true)
+
+	plan, err := tk.Plan(context.Background(), task.Env{Mode: report.ModePlan, Now: day(1)})
+	if err != nil {
+		t.Fatalf("a forced rehearsal must not be refused: %v", err)
+	}
+	got := notes(plan)
+	for _, want := range []string{"max_backup_bytes", "10 B", "bypass"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notes should mention %q, got:\n%s", want, got)
+		}
+	}
+
+	if _, err := tk.Apply(context.Background(), plan, task.Env{Mode: report.ModeApply, Now: day(1)}); err != nil {
+		t.Fatalf("a forced run must publish the snapshot: %v", err)
+	}
+	if len(names(t, dest)) != 1 {
+		t.Fatalf("destination holds %v, want the snapshot a forced run writes", names(t, dest))
+	}
+}
+
+// A forced run that fits under the ceiling has nothing to bypass, so it must not
+// claim one: a bypass note is evidence and has to stay accurate.
+func TestForceUnderTheCeilingRecordsNoBypass(t *testing.T) {
+	cfg, _, _ := backupConfig(t)
+	tk := newTask(t, cfg)
+	tk.SetForce(true)
+
+	plan, err := tk.Plan(context.Background(), task.Env{Mode: report.ModePlan, Now: day(1)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := notes(plan); strings.Contains(got, "bypass") {
+		t.Errorf("notes should not claim a bypass under the ceiling, got:\n%s", got)
+	}
+}
+
 // The ceiling refuses a rehearsal, so an operator learns about it without
 // running, and it refuses a run before anything is written.
 func TestMaxBackupBytesRefusesBeforeWriting(t *testing.T) {

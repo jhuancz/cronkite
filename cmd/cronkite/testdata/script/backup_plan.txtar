@@ -1,0 +1,29 @@
+# A backup rehearsal reports the work it would do and describes it as writing,
+# never as removing. It must also leave the filesystem alone: no destination
+# directory, no snapshot, no staging tree.
+
+cronkite plan -config cronkite.yaml -task data
+stdout 'would write'
+! stdout 'would remove'
+! exists backups
+! exists backups/data
+exists state/reports/latest.json
+
+# The plan reports the work in bytes to copy, and says where the snapshot would
+# be published.
+stdout 'to copy'
+stdout 'would publish one snapshot'
+
+-- cronkite.yaml --
+version: 1
+run:
+  state_dir: $WORK/state
+tasks:
+  - name: data
+    type: backup
+    roots: [$WORK/data]
+    destination: $WORK/backups/data
+-- data/app.conf --
+listen=8080
+-- data/logs/app.log --
+started

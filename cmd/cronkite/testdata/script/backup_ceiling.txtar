@@ -1,0 +1,35 @@
+# A plan above max_backup_bytes refuses the run before anything is written, and
+# publishes no destination. --force bypasses the ceiling the way it bypasses
+# run.safety, and the report records that it was bypassed.
+
+! cronkite run --apply -config cronkite.yaml
+stdout 'status=refused'
+stdout 'max_backup_bytes'
+stdout 'nothing was written'
+! exists backups
+
+# The same command with --force publishes the snapshot.
+cronkite run --apply -config cronkite.yaml -force
+exists backups/data
+
+# The bypass is in the report, so it is auditable instead of silent.
+cronkite report -config cronkite.yaml -json
+stdout '"status": "ok"'
+stdout 'max_backup_bytes'
+stdout 'bypassed by --force'
+
+-- cronkite.yaml --
+version: 1
+run:
+  state_dir: $WORK/state
+tasks:
+  - name: data
+    type: backup
+    roots: [$WORK/data]
+    destination: $WORK/backups/data
+    # The source tree below holds 20 B, so any run has to cross this ceiling.
+    max_backup_bytes: "1B"
+-- data/app.conf --
+listen=8080
+-- data/logs/app.log --
+started

@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +183,158 @@ tasks:
 	}
 	if rep.Totals.FilesRemoved != 3 {
 		t.Errorf("files removed = %d, want 3", rep.Totals.FilesRemoved)
+	}
+}
+
+// backupRunConfig assembles one backup task: a small source tree and a
+// destination beside it that does not exist yet.
+func backupRunConfig(t *testing.T, src, dest, extra string) *config.Config {
+	t.Helper()
+	return newConfig(t, fmt.Sprintf(`
+version: 1
+run:
+  state_dir: %s
+tasks:
+  - name: data
+    type: backup
+    roots: [%s]
+    destination: %s
+%s`, filepath.Join(t.TempDir(), "state"), src, dest, extra))
+}
+
+// backupSource writes the tree the backup scenarios below snapshot.
+func backupSource(t *testing.T) string {
+	t.Helper()
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "app.conf"), []byte("listen=8080\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "logs", "app.log"), []byte("started\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return src
+}
+
+// snapshotsIn lists the snapshot directories of a destination.
+func snapshotsIn(t *testing.T, dest string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		t.Fatalf("read %s: %v", dest, err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// A backup whose plan exceeds its own ceiling refuses the run with the refused
+// exit code, not the ordinary failure code, and writes nothing. The rehearsal
+// reports the same refusal, so the ceiling is visible without a run.
+func TestBackupCeilingRefusesTheRun(t *testing.T) {
+	src := backupSource(t)
+	dest := filepath.Join(t.TempDir(), "snapshots")
+	cfg := backupRunConfig(t, src, dest, "    max_backup_bytes: \"1B\"\n")
+
+	for _, scenario := range []struct {
+		name  string
+		apply bool
+	}{
+		{name: "plan", apply: false},
+		{name: "apply", apply: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			rep, err := Run(context.Background(), cfg, Options{Apply: scenario.apply, Now: fixedNow})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if rep.ExitCode != exitcode.Refused {
+				t.Errorf("exit code = %d, want %d", rep.ExitCode, exitcode.Refused)
+			}
+			if rep.Status != report.StatusRefused {
+				t.Errorf("status = %q, want refused", rep.Status)
+			}
+			if got := strings.Join(rep.Notes, "\n"); !strings.Contains(got, "max_backup_bytes") {
+				t.Errorf("the refusal should name the ceiling, got:\n%s", got)
+			}
+			// A refusal is not a failure: an operator has a decision to make, not a
+			// fault to retry, so the refused task is not counted as an error.
+			if rep.Tasks[0].Totals.Errors != 0 {
+				t.Errorf("a refusal must not be counted as an error, got %d", rep.Tasks[0].Totals.Errors)
+			}
+			if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("a refused run must create no destination, stat err = %v", statErr)
+			}
+		})
+	}
+}
+
+// --force reaches a task's own ceiling the way it reaches run.safety, and the
+// report records the bypass on the task it belonged to.
+func TestForceBypassesTheBackupCeiling(t *testing.T) {
+	src := backupSource(t)
+	dest := filepath.Join(t.TempDir(), "snapshots")
+	cfg := backupRunConfig(t, src, dest, "    max_backup_bytes: \"1B\"\n")
+
+	rep, err := Run(context.Background(), cfg, Options{Apply: true, Force: true, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.ExitCode != exitcode.OK {
+		t.Fatalf("exit code = %d (%s), want 0", rep.ExitCode, rep.Status)
+	}
+	if got := snapshotsIn(t, dest); len(got) != 1 {
+		t.Fatalf("destination holds %v, want the snapshot the forced run wrote", got)
+	}
+	if rep.Totals.FilesWritten != 2 || rep.Totals.BytesWritten != 20 {
+		t.Errorf("totals = %+v, want both files written for 20 B", rep.Totals)
+	}
+	notes := strings.Join(rep.Tasks[0].Notes, "\n")
+	for _, want := range []string{"max_backup_bytes", "bypass"} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("the task report should record the bypass (%q), got:\n%s", want, notes)
+		}
+	}
+}
+
+// A task whose plan fails for any other reason stays an ordinary failure: only a
+// ceiling breach is a refusal, so the two exit codes keep telling an operator
+// different things.
+func TestPlanFailureIsNotARefusal(t *testing.T) {
+	src := backupSource(t)
+	dest := filepath.Join(t.TempDir(), "snapshots")
+	// A snapshot-shaped directory whose index this build cannot read makes the
+	// plan fail. That is a fault to investigate, not a decision to make.
+	snapshot := filepath.Join(dest, "20260101T000000Z")
+	if err := os.MkdirAll(snapshot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshot, "manifest.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := backupRunConfig(t, src, dest, "")
+	rep, err := Run(context.Background(), cfg, Options{Apply: true, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.ExitCode != exitcode.Partial {
+		t.Errorf("exit code = %d, want %d", rep.ExitCode, exitcode.Partial)
+	}
+	if rep.Status == report.StatusRefused {
+		t.Errorf("status = %q, want a failure rather than a refusal", rep.Status)
+	}
+	if got := rep.Tasks[0].Status; got != report.StatusFailed {
+		t.Errorf("task status = %q, want failed", got)
 	}
 }
 

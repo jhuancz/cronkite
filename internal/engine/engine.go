@@ -39,6 +39,14 @@ type Options struct {
 	Now time.Time
 }
 
+// forceable is implemented by a task that owns a ceiling of its own, so --force
+// reaches it the way it reaches run.safety. A task without a ceiling does not
+// implement it: it has nothing to bypass, and a task that silently ignored the
+// flag would be worse than one that never saw it.
+type forceable interface {
+	SetForce(force bool)
+}
+
 // job tracks one task through the phases of a run.
 type job struct {
 	runner    task.Runner
@@ -87,6 +95,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 		if buildErr != nil {
 			return nil, buildErr
 		}
+		if f, ok := runner.(forceable); ok {
+			f.SetForce(opts.Force)
+		}
 		runners = append(runners, runner)
 	}
 
@@ -120,16 +131,17 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 		jobs = append(jobs, j)
 	}
 
-	// Phase 2: enforce the ceilings before anything is deleted.
+	// Phase 2: enforce the ceilings before anything is deleted, and refuse the
+	// run when a task's own plan does not fit its budget. Both refusals happen
+	// here because both mean the same thing: nothing has been applied, and a human
+	// has a configuration decision to make.
+	if refusal := planRefusal(jobs); refusal != "" {
+		refuseRun(rep, jobs, mode, cfg.Report.MaxActionsPerTask, refusal)
+		return rep, writeReports(cfg, rep)
+	}
 	if opts.Apply {
 		if refusal := checkSafety(cfg, jobs, opts.Force); refusal != "" {
-			rep.Notes = append(rep.Notes, refusal)
-			for _, j := range jobs {
-				j.refused = refusal
-				rep.Tasks = append(rep.Tasks, taskReport(j, mode, cfg.Report.MaxActionsPerTask))
-			}
-			rep.Status = report.StatusRefused
-			finish(rep, exitcode.Refused)
+			refuseRun(rep, jobs, mode, cfg.Report.MaxActionsPerTask, refusal)
 			return rep, writeReports(cfg, rep)
 		}
 		if opts.Force {
@@ -163,6 +175,35 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 
 	finish(rep, aggregate(rep))
 	return rep, writeReports(cfg, rep)
+}
+
+// planRefusal returns the message of the first task that refused its own plan,
+// or "" when every plan was produced.
+//
+// A task that decided its plan is too large is refusing, not failing: it asks
+// for a human decision, which is what exit code 4 is for. The check runs in both
+// modes, because a rehearsal that hid a refusal would let an operator discover
+// the ceiling from a run instead of from a plan.
+func planRefusal(jobs []*job) string {
+	for _, j := range jobs {
+		if j.planErr != nil && errors.Is(j.planErr, task.ErrCeiling) {
+			return j.planErr.Error()
+		}
+	}
+	return ""
+}
+
+// refuseRun records a refused run: the message, one refused task per plan, and
+// the refused exit code. A run is refused as a whole, so no task can claim it
+// ran and nothing is applied.
+func refuseRun(rep *report.Report, jobs []*job, mode report.Mode, maxActions int, message string) {
+	rep.Notes = append(rep.Notes, message)
+	for _, j := range jobs {
+		j.refused = message
+		rep.Tasks = append(rep.Tasks, taskReport(j, mode, maxActions))
+	}
+	rep.Status = report.StatusRefused
+	finish(rep, exitcode.Refused)
 }
 
 // checkSafety returns a refusal message when the planned run exceeds a
@@ -247,6 +288,13 @@ func taskReport(j *job, mode report.Mode, maxActions int) report.Task {
 		rt.Totals.Skipped = len(j.plan.Skipped)
 	}
 	if j.planErr != nil {
+		if j.refused != "" {
+			// The plan was refused, not broken: the run stopped for a human
+			// decision, the run notes say which, and nothing went wrong that a
+			// retry could fix, so it is not counted as a failure.
+			rt.Status = report.StatusRefused
+			return rt
+		}
 		rt.Status = report.StatusFailed
 		rt.Errors = append(rt.Errors, report.Failure{Path: j.runner.Name(), Error: j.planErr.Error()})
 		rt.Totals.Errors = 1
