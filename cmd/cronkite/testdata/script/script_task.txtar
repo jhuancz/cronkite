@@ -10,8 +10,11 @@
 # passed to the script verbatim, so a path that varies per host belongs here.
 env LOGS=$WORK/logs
 
+# The assertion is on what the script itself observed, not on cronkite's own notes:
+# a test that read the notes would pass even if the variable never reached the
+# script.
 cronkite plan -config cronkite.conf
-stdout 'CRONKITE_DRY_RUN=1'
+stdout 'script saw dry_run=1 mode=plan'
 stdout 'would remove old.log'
 exists logs/old.log
 
@@ -36,8 +39,10 @@ set -euo pipefail
 
 log_dir=${LOGS:?the run must set LOGS}
 
+echo "script saw dry_run=${CRONKITE_DRY_RUN} mode=${CRONKITE_MODE}"
+
 if [ "${CRONKITE_DRY_RUN}" = "1" ]; then
-	echo "would remove old.log from ${log_dir} during ${CRONKITE_MODE}"
+	echo "would remove old.log from ${log_dir}"
 	exit 0
 fi
 
