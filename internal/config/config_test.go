@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestUnknownKeyIsAnError is the reason this package exists: a typo must never
@@ -526,5 +527,25 @@ func TestCleanupTaskGainsNoScriptFields(t *testing.T) {
 	}
 	if task := cfg.Tasks[0]; task.Interpreter != "" || task.File != "" || task.Timeout != "" {
 		t.Fatalf("a logclean task gained script fields: %+v", task)
+	}
+}
+
+// The engine asks the configuration for the throttle window instead of parsing
+// the string itself, so the default and the parser live in one package.
+func TestNotifyThrottleDuration(t *testing.T) {
+	def, err := Parse([]byte("version: 1\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := def.NotifyThrottle(), 15*time.Minute; got != want {
+		t.Errorf("default notify.throttle = %s, want %s", got, want)
+	}
+
+	explicit, err := Parse([]byte("version: 1\nnotify:\n  throttle: 2h\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := explicit.NotifyThrottle(), 2*time.Hour; got != want {
+		t.Errorf("notify.throttle = %s, want %s", got, want)
 	}
 }

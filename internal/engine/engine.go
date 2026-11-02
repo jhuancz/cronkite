@@ -18,6 +18,7 @@ import (
 	"github.com/jhuancz/cronkite/internal/config"
 	"github.com/jhuancz/cronkite/internal/exitcode"
 	"github.com/jhuancz/cronkite/internal/lock"
+	"github.com/jhuancz/cronkite/internal/notify"
 	"github.com/jhuancz/cronkite/internal/report"
 	"github.com/jhuancz/cronkite/internal/task"
 	"github.com/jhuancz/cronkite/internal/tasks"
@@ -37,6 +38,10 @@ type Options struct {
 	Force bool
 	// Now is the reference time. Zero means time.Now.
 	Now time.Time
+	// Notifier overrides alert delivery. Zero means the sender the
+	// configuration names, which is Telegram. Tests inject one to observe
+	// delivery without a network.
+	Notifier notify.Notifier
 }
 
 // forceable is implemented by a task that owns a ceiling of its own, so --force
@@ -81,7 +86,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 	if len(selected) == 0 {
 		rep.Notes = append(rep.Notes, "no enabled task matched the selection; nothing to do")
 		finish(rep, exitcode.OK)
-		return rep, writeReports(cfg, rep)
+		return rep, finishRun(ctx, cfg, rep, opts.Notifier)
 	}
 
 	runners := make([]task.Runner, 0, len(selected))
@@ -108,7 +113,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 				rep.Notes = append(rep.Notes, "another run holds "+cfg.Run.LockFile+"; this run did nothing")
 				rep.Status = report.StatusSkipped
 				finish(rep, exitcode.Locked)
-				return rep, writeReports(cfg, rep)
+				return rep, finishRun(ctx, cfg, rep, opts.Notifier)
 			}
 			return nil, lockErr
 		}
@@ -137,12 +142,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 	// has a configuration decision to make.
 	if refusal := planRefusal(jobs); refusal != "" {
 		refuseRun(rep, jobs, mode, cfg.Report.MaxActionsPerTask, refusal)
-		return rep, writeReports(cfg, rep)
+		return rep, finishRun(ctx, cfg, rep, opts.Notifier)
 	}
 	if opts.Apply {
 		if refusal := checkSafety(cfg, jobs, opts.Force); refusal != "" {
 			refuseRun(rep, jobs, mode, cfg.Report.MaxActionsPerTask, refusal)
-			return rep, writeReports(cfg, rep)
+			return rep, finishRun(ctx, cfg, rep, opts.Notifier)
 		}
 		if opts.Force {
 			rep.Notes = append(rep.Notes, "safety ceilings bypassed (--force); limits were not enforced for this run")
@@ -174,7 +179,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 	}
 
 	finish(rep, aggregate(rep))
-	return rep, writeReports(cfg, rep)
+	return rep, finishRun(ctx, cfg, rep, opts.Notifier)
 }
 
 // planRefusal returns the message of the first task that refused its own plan,
@@ -387,7 +392,7 @@ func writeReports(cfg *config.Config, rep *report.Report) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create report directory: %w", err)
 	}
-	if err := rep.WriteFile(filepath.Join(dir, "run-"+rep.RunID+".json")); err != nil {
+	if err := rep.WriteFile(reportPath(cfg, rep)); err != nil {
 		return err
 	}
 	return rep.WriteFile(filepath.Join(dir, "latest.json"))

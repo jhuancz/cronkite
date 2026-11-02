@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -461,6 +462,19 @@ func (t Task) BackupBytes() (int64, error) {
 		return 0, fmt.Errorf("max_backup_bytes is %q: a ceiling of zero refuses every snapshot", limit)
 	}
 	return n, nil
+}
+
+// NotifyThrottle returns notify.throttle as a duration. Call after Load.
+//
+// A value that cannot be parsed reads as no window at all. The configuration is
+// validated before a run starts, so this is unreachable in a real run; if it ever
+// were reached, one alert too many is the safe direction for a throttle.
+func (c *Config) NotifyThrottle() time.Duration {
+	d, err := durationx.Parse(c.Notify.Throttle)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 // TaskNames returns the configured task names in file order.
