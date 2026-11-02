@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -41,6 +42,10 @@ import (
 
 // ManifestSchema is the manifest format version. Bump it when a field is
 // removed or its meaning changes, never for additive changes.
+//
+// It stays 1 now that "dirs" exists: the field is additive, a manifest written
+// without it reads as "no directory records" instead of failing, and no released
+// build has ever read this format, so there is no consumer to migrate.
 const ManifestSchema = 1
 
 // ManifestName is the file name of the manifest inside a snapshot directory.
@@ -63,6 +68,21 @@ type Entry struct {
 	SHA256  string    `json:"sha256"`
 }
 
+// Dir is one directory recorded in a snapshot.
+//
+// A snapshot that only recorded files would restore an application without its
+// upload or cache directory, so the directory skeleton is part of the index even
+// when a directory holds nothing. Path follows the same rules as Entry.Path.
+//
+// Mode holds the source permission bits (the 0o777 mask): they are advisory on
+// Windows, where the platform cannot carry more than a read-only hint, and a
+// restore applies them where the platform allows it. ModTime is stored in UTC.
+type Dir struct {
+	Path    string    `json:"path"`
+	ModTime time.Time `json:"mtime"`
+	Mode    uint32    `json:"mode"`
+}
+
 // Manifest is the index of one snapshot.
 //
 // Its JSON form is the public surface a future verify command and a restore
@@ -70,7 +90,7 @@ type Entry struct {
 //
 //	{
 //	  "schema": 1,                    // manifest format version
-//	  "digest": "<64 hex chars>",     // aggregate digest over "files"
+//	  "digest": "<64 hex chars>",     // aggregate digest over "files" and "dirs"
 //	  "files": [
 //	    {
 //	      "path": "logs/app.log",     // relative to the snapshot root, slash-separated
@@ -78,21 +98,29 @@ type Entry struct {
 //	      "mtime": "2026-03-01T12:00:00.123456789Z",  // UTC, RFC 3339 with nanoseconds
 //	      "sha256": "<64 hex chars>"  // digest of the file content
 //	    }
+//	  ],
+//	  "dirs": [
+//	    {
+//	      "path": "uploads",          // same path rules as a file record
+//	      "mtime": "2026-03-01T12:00:00.123456789Z",
+//	      "mode": 493                 // source permission bits, 0o755 here
+//	    }
 //	  ]
 //	}
 //
-// "files" is sorted by "path". "digest" covers the records and not itself, so
-// the digest of a snapshot can be recomputed from the file and compared without
-// trusting the value on disk.
+// "files" and "dirs" are each sorted by "path". "digest" covers the records and
+// not itself, so the digest of a snapshot can be recomputed from the file and
+// compared without trusting the value on disk.
 type Manifest struct {
 	Schema int     `json:"schema"`
 	Digest string  `json:"digest"`
 	Files  []Entry `json:"files"`
+	Dirs   []Dir   `json:"dirs"`
 }
 
 // NewManifest returns an empty manifest carrying the current schema.
 func NewManifest() *Manifest {
-	return &Manifest{Schema: ManifestSchema, Files: []Entry{}}
+	return &Manifest{Schema: ManifestSchema, Files: []Entry{}, Dirs: []Dir{}}
 }
 
 // Add records one file. Entries are kept sorted by path, and a repeated path or
@@ -111,6 +139,23 @@ func (m *Manifest) Add(e Entry) error {
 	return nil
 }
 
+// AddDir records one directory, keeping the same ordering and duplicate rules as
+// Add. A directory is recorded even when it holds no file, because a restore has
+// to reproduce the tree and not only its files.
+func (m *Manifest) AddDir(d Dir) error {
+	if err := validateDir(d); err != nil {
+		return err
+	}
+	i := sort.Search(len(m.Dirs), func(i int) bool { return m.Dirs[i].Path >= d.Path })
+	if i < len(m.Dirs) && m.Dirs[i].Path == d.Path {
+		return fmt.Errorf("manifest: duplicate entry %q", d.Path)
+	}
+	m.Dirs = append(m.Dirs, Dir{})
+	copy(m.Dirs[i+1:], m.Dirs[i:])
+	m.Dirs[i] = d
+	return nil
+}
+
 // Lookup returns the record for a snapshot-relative, slash-separated path.
 //
 // A nil manifest misses, so callers fitting a first snapshot and a later one
@@ -126,12 +171,15 @@ func (m *Manifest) Lookup(rel string) (Entry, bool) {
 	return Entry{}, false
 }
 
-// ComputeDigest returns the aggregate digest of the recorded files.
+// ComputeDigest returns the aggregate digest of the recorded files and
+// directories.
 //
-// Each record contributes its path, size, mtime in UTC nanoseconds and content
-// digest, so the result depends on the tree and not on the order the records
-// were added. Two snapshots of an unchanged tree therefore share a digest, and
-// comparing them costs one string comparison instead of a full re-hash.
+// Each file record contributes its path, size, mtime in UTC nanoseconds and
+// content digest; each directory record contributes its path, mtime and mode, so
+// two snapshots that differ only in an empty directory do not share a digest.
+// The result depends on the tree and not on the order the records were added.
+// Two snapshots of an unchanged tree therefore share a digest, and comparing them
+// costs one string comparison instead of a full re-hash.
 func (m *Manifest) ComputeDigest() string {
 	if m == nil {
 		return ""
@@ -139,12 +187,22 @@ func (m *Manifest) ComputeDigest() string {
 	files := make([]Entry, len(m.Files))
 	copy(files, m.Files)
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	dirs := make([]Dir, len(m.Dirs))
+	copy(dirs, m.Dirs)
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Path < dirs[j].Path })
 
 	h := sha256.New()
 	for _, e := range files {
 		// A NUL cannot appear in a path, so the fields cannot be forged into
 		// each other.
 		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%s\n", e.Path, e.Size, e.ModTime.UTC().UnixNano(), hex.EncodeToString(mustDigest(e.SHA256)))
+	}
+	for _, d := range dirs {
+		// A directory line starts with a NUL, which no path may contain, so a
+		// file record can never be read as a directory record. A manifest without
+		// directory records hashes exactly the bytes it hashed before this field
+		// existed, so an older manifest still verifies against its own records.
+		fmt.Fprintf(h, "\x00dir\x00%s\x00%o\x00%d\n", d.Path, d.Mode, d.ModTime.UTC().UnixNano())
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -157,11 +215,11 @@ func (m *Manifest) Seal() { m.Digest = m.ComputeDigest() }
 // rename. A reader never sees a half-written manifest, which matters because a
 // truncated manifest would make a complete snapshot look empty.
 func (m *Manifest) WriteFile(path string) error {
-	files, err := m.canonical()
+	files, dirs, err := m.canonical()
 	if err != nil {
 		return fmt.Errorf("manifest %s: %w", path, err)
 	}
-	out := &Manifest{Schema: ManifestSchema, Files: files}
+	out := &Manifest{Schema: ManifestSchema, Files: files, Dirs: dirs}
 	out.Seal()
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.json")
@@ -207,11 +265,12 @@ func ReadFile(path string) (*Manifest, error) {
 	if m.Schema != ManifestSchema {
 		return nil, fmt.Errorf("%w: %s has schema %d, this build reads schema %d", ErrUnknownSchema, path, m.Schema, ManifestSchema)
 	}
-	files, err := m.canonical()
+	files, dirs, err := m.canonical()
 	if err != nil {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	m.Files = files
+	m.Dirs = dirs
 	// A manifest carries its own aggregate digest, so it can be checked instead
 	// of trusted. A digest that does not match its records means the file was
 	// truncated, edited, or written by something that was not this build.
@@ -225,9 +284,9 @@ func ReadFile(path string) (*Manifest, error) {
 
 // canonical validates the records and returns them sorted by path with the
 // schema checked, so both writing and reading agree on one shape.
-func (m *Manifest) canonical() ([]Entry, error) {
+func (m *Manifest) canonical() ([]Entry, []Dir, error) {
 	if m.Schema != ManifestSchema {
-		return nil, fmt.Errorf("%w: schema is %d, this build writes %d", ErrUnknownSchema, m.Schema, ManifestSchema)
+		return nil, nil, fmt.Errorf("%w: schema is %d, this build writes %d", ErrUnknownSchema, m.Schema, ManifestSchema)
 	}
 	files := make([]Entry, len(m.Files))
 	copy(files, m.Files)
@@ -235,37 +294,50 @@ func (m *Manifest) canonical() ([]Entry, error) {
 
 	for i, e := range files {
 		if err := validateEntry(e); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if i > 0 && files[i-1].Path == e.Path {
-			return nil, fmt.Errorf("manifest: duplicate entry %q", e.Path)
+			return nil, nil, fmt.Errorf("manifest: duplicate entry %q", e.Path)
 		}
 		// One spelling of a digest: the aggregate digest lowercases internally,
 		// so an upper-case record would make two equal trees compare unequal.
 		files[i].SHA256 = strings.ToLower(e.SHA256)
 	}
-	return files, nil
+
+	dirs := make([]Dir, len(m.Dirs))
+	copy(dirs, m.Dirs)
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Path < dirs[j].Path })
+	for i, d := range dirs {
+		if err := validateDir(d); err != nil {
+			return nil, nil, err
+		}
+		if i > 0 && dirs[i-1].Path == d.Path {
+			return nil, nil, fmt.Errorf("manifest: duplicate entry %q", d.Path)
+		}
+	}
+
+	// A path cannot be a file and a directory at once, and a manifest that said
+	// so would describe two different trees with one digest.
+	for i, j := 0, 0; i < len(files) && j < len(dirs); {
+		switch {
+		case files[i].Path < dirs[j].Path:
+			i++
+		case dirs[j].Path < files[i].Path:
+			j++
+		default:
+			return nil, nil, fmt.Errorf("manifest: %q is recorded as both a file and a directory", files[i].Path)
+		}
+	}
+	return files, dirs, nil
 }
 
 // validateEntry enforces what the manifest promises: a relative,
 // slash-separated, clean path and a record complete enough to restore from.
 func validateEntry(e Entry) error {
+	if err := validatePath(e.Path); err != nil {
+		return err
+	}
 	switch {
-	case e.Path == "":
-		return errors.New("manifest entry: empty path")
-	case containsBackslash(e.Path):
-		return fmt.Errorf("manifest entry %q: paths are slash-separated on every platform", e.Path)
-	case !utf8.ValidString(e.Path):
-		// JSON cannot carry invalid UTF-8: decoding would coerce the bytes to
-		// the replacement character and two distinct names would collapse into
-		// one, producing a manifest this build can no longer read.
-		return fmt.Errorf("manifest entry %q: path is not valid UTF-8", e.Path)
-	case e.Path == ":":
-		return fmt.Errorf("manifest entry %q: a bare %q is not a usable path", e.Path, ":")
-	case path.IsAbs(e.Path), filepath.IsAbs(e.Path):
-		return fmt.Errorf("manifest entry %q: paths are relative to the snapshot root", e.Path)
-	case e.Path == "." || e.Path == ".." || strings.HasPrefix(e.Path, "../") || path.Clean(e.Path) != e.Path:
-		return fmt.Errorf("manifest entry %q: paths must be clean and must not climb out of the snapshot", e.Path)
 	case e.Size < 0:
 		return fmt.Errorf("manifest entry %q: negative size %d", e.Path, e.Size)
 	case e.ModTime.IsZero():
@@ -273,6 +345,44 @@ func validateEntry(e Entry) error {
 	}
 	if _, err := hex.DecodeString(e.SHA256); err != nil || len(e.SHA256) != sha256.Size*2 {
 		return fmt.Errorf("manifest entry %q: sha256 must be %d hex characters", e.Path, sha256.Size*2)
+	}
+	return nil
+}
+
+// validateDir enforces the same path rules as a file record, plus a mode a
+// restore can actually apply.
+func validateDir(d Dir) error {
+	if err := validatePath(d.Path); err != nil {
+		return err
+	}
+	switch {
+	case d.ModTime.IsZero():
+		return fmt.Errorf("manifest entry %q: missing modification time", d.Path)
+	case d.Mode&^uint32(fs.ModePerm) != 0:
+		return fmt.Errorf("manifest entry %q: mode %#o has bits outside the permission mask %#o", d.Path, d.Mode, fs.ModePerm)
+	}
+	return nil
+}
+
+// validatePath is the one set of path rules every record obeys, whichever kind
+// of entry it describes.
+func validatePath(p string) error {
+	switch {
+	case p == "":
+		return errors.New("manifest entry: empty path")
+	case containsBackslash(p):
+		return fmt.Errorf("manifest entry %q: paths are slash-separated on every platform", p)
+	case !utf8.ValidString(p):
+		// JSON cannot carry invalid UTF-8: decoding would coerce the bytes to
+		// the replacement character and two distinct names would collapse into
+		// one, producing a manifest this build can no longer read.
+		return fmt.Errorf("manifest entry %q: path is not valid UTF-8", p)
+	case p == ":":
+		return fmt.Errorf("manifest entry %q: a bare %q is not a usable path", p, ":")
+	case path.IsAbs(p), filepath.IsAbs(p):
+		return fmt.Errorf("manifest entry %q: paths are relative to the snapshot root", p)
+	case p == "." || p == ".." || strings.HasPrefix(p, "../") || path.Clean(p) != p:
+		return fmt.Errorf("manifest entry %q: paths must be clean and must not climb out of the snapshot", p)
 	}
 	return nil
 }

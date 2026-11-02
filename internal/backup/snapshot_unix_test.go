@@ -44,6 +44,75 @@ func TestWriteSkipsNonRegularFiles(t *testing.T) {
 	}
 }
 
+// A directory name the manifest cannot represent costs that directory, not the
+// snapshot: the rest of the tree is still backed up and the skip is reported.
+func TestWriteSkipsUnrepresentableDirectory(t *testing.T) {
+	tests := []struct {
+		name string
+		// makeDir creates the unrepresentable directory and returns its name.
+		makeDir func(t *testing.T, root string) string
+	}{
+		{
+			name: "backslash",
+			makeDir: func(t *testing.T, root string) string {
+				t.Helper()
+				name := `weird\dir`
+				if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return name
+			},
+		},
+		{
+			name: "invalid UTF-8",
+			makeDir: func(t *testing.T, root string) string {
+				t.Helper()
+				name := "cache-\xff"
+				if err := os.Mkdir(filepath.Join(root, name), 0o755); err != nil {
+					t.Skipf("filesystem refuses non-UTF-8 names: %v", err)
+				}
+				return name
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := t.TempDir()
+			name := tt.makeDir(t, src)
+			// A file inside it proves the whole subtree is left out, not only the
+			// directory entry itself.
+			writeSourceFile(t, src, filepath.Join(name, "inner.txt"), "inner")
+			writeSourceFile(t, src, "ok.txt", "ok")
+
+			res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "d")).Write(context.Background(), firstRun)
+			if err != nil {
+				t.Fatalf("one unrepresentable directory must not abort the snapshot: %v", err)
+			}
+
+			var skipped *Skip
+			for i, s := range res.Skipped {
+				if s.Path == name {
+					skipped = &res.Skipped[i]
+				}
+			}
+			if skipped == nil || skipped.Reason != ReasonNotRepresentable {
+				t.Fatalf("skipped = %+v, want %q recorded as %q", res.Skipped, name, ReasonNotRepresentable)
+			}
+
+			m := readSnapshotManifest(t, res.Snapshot)
+			if _, ok := manifestDir(m, name); ok {
+				t.Fatalf("an unrepresentable directory must not be recorded: %+v", m.Dirs)
+			}
+			if _, err := os.Lstat(filepath.Join(res.Snapshot, name)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the directory must not appear in the snapshot, lstat error: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(res.Snapshot, "ok.txt")); err != nil {
+				t.Errorf("the rest of the tree must still be backed up: %v", err)
+			}
+		})
+	}
+}
+
 // A Unix file name may contain a backslash, which the manifest refuses because
 // on Windows it would restore as a path separator. Skipping that one name must
 // not abort the backup of everything else.

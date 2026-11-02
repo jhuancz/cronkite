@@ -538,6 +538,267 @@ func TestNewWriterRefusesDestinationInsideSource(t *testing.T) {
 	}
 }
 
+// Everything a plain `cp -a` restore needs is in the snapshot: the same
+// entries, and directories that hold nothing. A snapshot that only held files
+// would leave a restored application without its upload or cache directory.
+func TestWriteRecordsEmptyDirectory(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "app.conf", "listen=8080")
+	for _, rel := range []string{"uploads", "uploads/incoming"} {
+		if err := os.MkdirAll(filepath.Join(src, filepath.FromSlash(rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dest := filepath.Join(t.TempDir(), "backups")
+
+	res, err := newWriter(t, []string{src}, dest).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// The directories exist in the snapshot, even though they hold no file.
+	for _, rel := range []string{"uploads", "uploads/incoming"} {
+		info, err := os.Stat(filepath.Join(res.Snapshot, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("%s must exist in the snapshot: %v", rel, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("%s is %v, want a directory", rel, info.Mode())
+		}
+	}
+
+	// The record carries what a restore needs: the path, the source mode and the
+	// source modification time.
+	m := readSnapshotManifest(t, res.Snapshot)
+	for _, rel := range []string{"uploads", "uploads/incoming"} {
+		d, ok := manifestDir(m, rel)
+		if !ok {
+			t.Fatalf("manifest is missing the directory %s: %+v", rel, m.Dirs)
+		}
+		srcInfo, err := os.Stat(filepath.Join(src, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Mode != uint32(srcInfo.Mode().Perm()) {
+			t.Errorf("%s mode = %#o, want the source mode %#o", rel, d.Mode, srcInfo.Mode().Perm())
+		}
+		// Truncated to the second because filesystem timestamp granularity varies.
+		if got := d.ModTime.Truncate(time.Second); !got.Equal(srcInfo.ModTime().UTC().Truncate(time.Second)) {
+			t.Errorf("%s mtime = %v, want %v", rel, got, srcInfo.ModTime().UTC())
+		}
+	}
+
+	// The restore an operator actually performs, without the manifest: a plain
+	// `cp -a` of the snapshot reproduces the empty directories.
+	restored := filepath.Join(t.TempDir(), "restored")
+	cpRestore(t, res.Snapshot, restored)
+	empty := filepath.Join(restored, "uploads", "incoming")
+	info, err := os.Stat(empty)
+	if err != nil {
+		t.Fatalf("the restored tree is missing the empty directory: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is %v, want a directory", empty, info.Mode())
+	}
+	if names := dirNames(t, empty); len(names) != 0 {
+		t.Fatalf("the restored directory holds %v, want nothing", names)
+	}
+	if got := readSnapshotFile(t, restored, "app.conf"); got != "listen=8080" {
+		t.Fatalf("restored content = %q, want %q", got, "listen=8080")
+	}
+}
+
+// A directory whose only children are skipped entries is still part of the
+// tree: the walk visits it, so the snapshot must hold it.
+func TestWriteRecordsDirectoryWithOnlySkippedChildren(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "app.conf", "listen=8080")
+	cache := filepath.Join(src, "cache")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(src, "app.conf"), filepath.Join(cache, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "backups")).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(res.Snapshot, "cache"))
+	if err != nil {
+		t.Fatalf("a directory whose only children are skipped must exist in the snapshot: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("cache is %v, want a directory", info.Mode())
+	}
+	m := readSnapshotManifest(t, res.Snapshot)
+	if _, ok := manifestDir(m, "cache"); !ok {
+		t.Fatalf("manifest is missing the directory cache: %+v", m.Dirs)
+	}
+
+	// The skipped child is reported, not recorded, and the directory is not
+	// reported as a skip of its own.
+	if len(res.Skipped) != 1 || res.Skipped[0].Path != "cache/link" || res.Skipped[0].Reason != ReasonSymlink {
+		t.Fatalf("skipped = %+v, want only cache/link as %q", res.Skipped, ReasonSymlink)
+	}
+	if _, ok := m.Lookup("cache/link"); ok {
+		t.Fatal("a skipped symlink must not be recorded in the manifest")
+	}
+}
+
+// A directory that holds files is visited by the walk and used as a file's
+// parent, and it must end up with exactly one record either way.
+func TestWriteRecordsDirectoryOfCopiedFile(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "logs/app.log", "alpha")
+
+	res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "backups")).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	m := readSnapshotManifest(t, res.Snapshot)
+	if len(m.Dirs) != 1 {
+		t.Fatalf("dirs = %+v, want exactly one record for logs", m.Dirs)
+	}
+	d, ok := manifestDir(m, "logs")
+	if !ok {
+		t.Fatalf("manifest is missing the directory logs: %+v", m.Dirs)
+	}
+	if d.Mode == 0 {
+		t.Fatalf("the record for logs carries no mode: %+v", d)
+	}
+	if got := readSnapshotFile(t, res.Snapshot, "logs/app.log"); got != "alpha" {
+		t.Fatalf("snapshot content = %q, want %q", got, "alpha")
+	}
+}
+
+// The source mode is what a restore reproduces, so the snapshot directory must
+// carry it. Windows keeps permission bits as a hint only, so it is exempt.
+func TestWriteAppliesDirectoryMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are advisory on Windows")
+	}
+
+	src := t.TempDir()
+	dir := filepath.Join(src, "uploads")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "backups")).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(res.Snapshot, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("snapshot directory mode = %#o, want the source mode %#o", got, 0o700)
+	}
+}
+
+// Two trees that differ only in an empty directory are different trees, so the
+// digest has to follow the directory skeleton and not only the files.
+func TestWriteDigestChangesWithDirectory(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "app.conf", "listen=8080")
+	dest := filepath.Join(t.TempDir(), "backups")
+	w := newWriter(t, []string{src}, dest)
+
+	first, err := w.Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+
+	cache := filepath.Join(src, "cache")
+	if err := os.Mkdir(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second, err := w.Write(context.Background(), firstRun.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	if second.Digest == first.Digest {
+		t.Fatal("adding an empty directory must change the digest")
+	}
+	info, err := os.Stat(filepath.Join(second.Snapshot, "cache"))
+	if err != nil || !info.IsDir() {
+		t.Fatalf("the added directory must exist in the snapshot, stat: %v", err)
+	}
+
+	if err := os.Remove(cache); err != nil {
+		t.Fatal(err)
+	}
+	third, err := w.Write(context.Background(), firstRun.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("third Write: %v", err)
+	}
+	if third.Digest == second.Digest {
+		t.Fatal("removing an empty directory must change the digest")
+	}
+	// The tree is back to its first shape, so the digest must be too: the digest
+	// is a function of the tree, not of the order the records were written.
+	if third.Digest != first.Digest {
+		t.Fatalf("digest = %q, want the first snapshot's %q", third.Digest, first.Digest)
+	}
+}
+
+// cpRestore reproduces a tree the way `cp -a` does: the same entries, the same
+// bytes, and the directory mode and timestamps, without reading the snapshot's
+// manifest. It is the plain restore an operator performs.
+func cpRestore(t *testing.T, from, to string) {
+	t.Helper()
+	info, err := os.Stat(from)
+	if err != nil {
+		t.Fatalf("restore %s: %v", from, err)
+	}
+	if err := cpEntry(from, to, info); err != nil {
+		t.Fatalf("restore %s: %v", from, err)
+	}
+}
+
+func cpEntry(from, to string, info fs.FileInfo) error {
+	if !info.IsDir() {
+		data, err := os.ReadFile(from)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(to, data, info.Mode().Perm()); err != nil {
+			return err
+		}
+		return os.Chtimes(to, info.ModTime(), info.ModTime())
+	}
+
+	if err := os.MkdirAll(to, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		child, err := e.Info()
+		if err != nil {
+			return err
+		}
+		if err := cpEntry(filepath.Join(from, e.Name()), filepath.Join(to, e.Name()), child); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(to, info.Mode().Perm()); err != nil {
+		return err
+	}
+	return os.Chtimes(to, info.ModTime(), info.ModTime())
+}
+
 func guardFor(t *testing.T, roots ...string) *fsx.Guard {
 	t.Helper()
 	g, err := fsx.NewGuard(roots, nil)

@@ -172,6 +172,13 @@ func (w *Writer) Close() error {
 	return err
 }
 
+// dirMode is one snapshot directory whose source permission bits are applied
+// once the tree below it has been written.
+type dirMode struct {
+	path string
+	mode fs.FileMode
+}
+
 // Write builds one snapshot and publishes it under its timestamp directory.
 //
 // The tree is written into a temporary directory inside the destination and
@@ -231,6 +238,10 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	// entries vulnerable to a power loss that the manifest no longer matches.
 	touchedDirs := map[string]struct{}{}
 	var dirsToSync []string
+	// Directories whose source mode is applied last: a directory restored with
+	// its real mode may be read-only, and the files inside it could then no
+	// longer be written.
+	var dirModes []dirMode
 	walkErr := w.source.Walk(0, func(abs, rel string, d fs.DirEntry) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -250,7 +261,28 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 			return nil
 		}
 		if d.IsDir() {
-			return nil
+			if !representable(relSlash) {
+				res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRepresentable})
+				// Nothing below it can be represented either: every path in the
+				// subtree carries the same component.
+				return fs.SkipDir
+			}
+			info, err := d.Info()
+			if err != nil {
+				res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonUnreadable})
+				return fs.SkipDir
+			}
+
+			dst := filepath.Join(stage, filepath.FromSlash(relSlash))
+			// Created even when it will hold nothing: an application that loses its
+			// upload or cache directory has not been restored.
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				return fmt.Errorf("create %s: %w", dst, err)
+			}
+			collectSyncDirs(touchedDirs, &dirsToSync, stage, dst)
+			perm := info.Mode().Perm()
+			dirModes = append(dirModes, dirMode{path: dst, mode: perm})
+			return manifest.AddDir(Dir{Path: relSlash, ModTime: info.ModTime().UTC(), Mode: uint32(perm)})
 		}
 
 		switch {
@@ -278,12 +310,7 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", filepath.Dir(dst), err)
 		}
-		for dir := filepath.Dir(dst); dir != stage && within(stage, dir); dir = filepath.Dir(dir) {
-			if _, seen := touchedDirs[dir]; !seen {
-				touchedDirs[dir] = struct{}{}
-				dirsToSync = append(dirsToSync, dir)
-			}
-		}
+		collectSyncDirs(touchedDirs, &dirsToSync, stage, filepath.Dir(dst))
 		entry := Entry{Path: relSlash, Size: info.Size(), ModTime: info.ModTime().UTC()}
 
 		// Incrementality is decided from the manifest, not from the source: a
@@ -323,6 +350,18 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		return res, fmt.Errorf("walk source %s: %w", w.source.Dir(), walkErr)
 	}
 
+	// The source mode goes on last, deepest first: everything below each directory
+	// is already written, so a read-only source directory no longer blocks it. A
+	// platform that cannot express the mode (Windows keeps permission bits as a
+	// hint) is not an error, and neither is a filesystem that refuses the change:
+	// the tree is still complete, only less faithful.
+	for i := len(dirModes) - 1; i >= 0; i-- {
+		d := dirModes[i]
+		if err := os.Chmod(d.path, d.mode); err != nil && runtime.GOOS != "windows" {
+			return res, fmt.Errorf("apply source mode %#o to snapshot directory %s: %w", d.mode, d.path, err)
+		}
+	}
+
 	if err := manifest.WriteFile(filepath.Join(stage, ManifestName)); err != nil {
 		return res, fmt.Errorf("write snapshot manifest: %w", err)
 	}
@@ -351,6 +390,19 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	res.Snapshot = final
 	res.Digest = manifest.Digest
 	return res, nil
+}
+
+// collectSyncDirs records dir and its ancestors below stage, so every directory
+// whose entry list changed is flushed before the snapshot is published.
+func collectSyncDirs(seen map[string]struct{}, list *[]string, stage, dir string) {
+	for ; dir != stage && within(stage, dir); dir = filepath.Dir(dir) {
+		if _, ok := seen[dir]; ok {
+			// The ancestors of a registered directory were registered with it.
+			return
+		}
+		seen[dir] = struct{}{}
+		*list = append(*list, dir)
+	}
 }
 
 // stageMaxAge is how long an abandoned stage directory may survive. Only a

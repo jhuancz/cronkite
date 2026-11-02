@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,27 @@ func testEntry(path string, size int64) Entry {
 		ModTime: entryTime,
 		SHA256:  strings.Repeat("ab", 32),
 	}
+}
+
+func testDir(path string, mode fs.FileMode) Dir {
+	return Dir{Path: path, ModTime: entryTime, Mode: uint32(mode.Perm())}
+}
+
+func mustAddDir(t *testing.T, m *Manifest, d Dir) {
+	t.Helper()
+	if err := m.AddDir(d); err != nil {
+		t.Fatalf("AddDir(%q): %v", d.Path, err)
+	}
+}
+
+// manifestDir returns the directory record for a path, if the manifest has one.
+func manifestDir(m *Manifest, path string) (Dir, bool) {
+	for _, d := range m.Dirs {
+		if d.Path == path {
+			return d, true
+		}
+	}
+	return Dir{}, false
 }
 
 func newTestManifest(t *testing.T, paths ...string) *Manifest {
@@ -260,6 +282,182 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestManifestAddDirKeepsPathOrder(t *testing.T) {
+	m := NewManifest()
+	for _, p := range []string{"uploads", "cache", "logs/old"} {
+		mustAddDir(t, m, testDir(p, 0o755))
+	}
+
+	want := []string{"cache", "logs/old", "uploads"}
+	if len(m.Dirs) != len(want) {
+		t.Fatalf("Dirs = %+v, want %v", m.Dirs, want)
+	}
+	for i, p := range want {
+		if m.Dirs[i].Path != p {
+			t.Fatalf("Dirs[%d] = %q, want %q (entries must stay in path order)", i, m.Dirs[i].Path, p)
+		}
+	}
+	if len(m.Files) != 0 {
+		t.Fatalf("Files = %+v, want none: a directory record is not a file", m.Files)
+	}
+
+	// A repeated directory is refused, and the record already stored stands.
+	if err := m.AddDir(testDir("cache", 0o700)); err == nil {
+		t.Fatal("expected a duplicate path to be refused")
+	}
+	if len(m.Dirs) != 3 || m.Dirs[0] != testDir("cache", 0o755) {
+		t.Fatalf("the refused record must not be stored: %+v", m.Dirs)
+	}
+}
+
+func TestManifestRejectsInvalidDir(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  Dir
+	}{
+		{name: "empty path", dir: Dir{Path: "", ModTime: entryTime, Mode: 0o755}},
+		{name: "absolute", dir: Dir{Path: "/uploads", ModTime: entryTime, Mode: 0o755}},
+		{name: "parent traversal", dir: Dir{Path: "../uploads", ModTime: entryTime, Mode: 0o755}},
+		{name: "dot", dir: Dir{Path: ".", ModTime: entryTime, Mode: 0o755}},
+		{name: "trailing separator", dir: Dir{Path: "uploads/", ModTime: entryTime, Mode: 0o755}},
+		{name: "backslash", dir: Dir{Path: `up\loads`, ModTime: entryTime, Mode: 0o755}},
+		{name: "zero mtime", dir: Dir{Path: "uploads", Mode: 0o755}},
+		{name: "mode above permission bits", dir: Dir{Path: "uploads", ModTime: entryTime, Mode: 0o7777}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManifest()
+			if err := m.AddDir(tt.dir); err == nil {
+				t.Fatalf("expected %+v to be refused", tt.dir)
+			}
+			if len(m.Dirs) != 0 {
+				t.Fatalf("the refused record must not be stored: %+v", m.Dirs)
+			}
+		})
+	}
+}
+
+// The directory skeleton is part of the tree: two snapshots that differ only in
+// an empty directory must not share a digest.
+func TestManifestDigestCoversDirectories(t *testing.T) {
+	base := func() *Manifest {
+		m := NewManifest()
+		if err := m.Add(testEntry("a.txt", 1)); err != nil {
+			t.Fatal(err)
+		}
+		mustAddDir(t, m, testDir("cache", 0o755))
+		return m
+	}
+	reference := base().ComputeDigest()
+
+	changes := map[string]func(m *Manifest){
+		"directory added":        func(m *Manifest) { mustAddDir(t, m, testDir("uploads", 0o755)) },
+		"directory removed":      func(m *Manifest) { m.Dirs = nil },
+		"directory path changed": func(m *Manifest) { m.Dirs[0].Path = "cache2" },
+		"directory mode changed": func(m *Manifest) { m.Dirs[0].Mode = 0o700 },
+		"directory mtime changed": func(m *Manifest) {
+			m.Dirs[0].ModTime = m.Dirs[0].ModTime.Add(time.Second)
+		},
+	}
+	for name, change := range changes {
+		t.Run(name, func(t *testing.T) {
+			m := base()
+			change(m)
+			if m.ComputeDigest() == reference {
+				t.Fatalf("changing the %s must change the digest", name)
+			}
+		})
+	}
+
+	dirsOnly := NewManifest()
+	mustAddDir(t, dirsOnly, testDir("cache", 0o755))
+	if dirsOnly.ComputeDigest() == NewManifest().ComputeDigest() {
+		t.Fatal("a tree with one empty directory must not share the digest of an empty tree")
+	}
+
+	forward := NewManifest()
+	mustAddDir(t, forward, testDir("uploads", 0o755))
+	mustAddDir(t, forward, testDir("cache", 0o755))
+	reverse := NewManifest()
+	mustAddDir(t, reverse, testDir("cache", 0o755))
+	mustAddDir(t, reverse, testDir("uploads", 0o755))
+	if forward.ComputeDigest() != reverse.ComputeDigest() {
+		t.Fatal("two manifests with the same directory records must share one digest")
+	}
+}
+
+func TestManifestRoundTripWithDirectories(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ManifestName)
+
+	m := NewManifest()
+	if err := m.Add(testEntry("logs/app.log", 3)); err != nil {
+		t.Fatal(err)
+	}
+	mustAddDir(t, m, testDir("uploads", 0o750))
+	mustAddDir(t, m, testDir("cache/old", 0o700))
+	if err := m.WriteFile(path); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(got.Dirs) != 2 {
+		t.Fatalf("dirs = %+v, want 2 records", got.Dirs)
+	}
+	if got.Dirs[0] != testDir("cache/old", 0o700) {
+		t.Fatalf("round trip changed the record: %+v", got.Dirs[0])
+	}
+	if got.Dirs[1] != testDir("uploads", 0o750) {
+		t.Fatalf("round trip changed the record: %+v", got.Dirs[1])
+	}
+	if got.ComputeDigest() != got.Digest {
+		t.Fatal("the stored digest must match the records it covers")
+	}
+
+	// The directory field names are part of the public surface, like the file ones.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{`"dirs"`, `"mode": 488`, `"mtime": "2026-03-01T12:00:00.123456789Z"`} {
+		if !bytes.Contains(raw, []byte(needle)) {
+			t.Fatalf("manifest JSON is missing %s:\n%s", needle, raw)
+		}
+	}
+}
+
+// A manifest written before directory records existed has no "dirs" key at all.
+// It must still read, and it must mean "no directory records" rather than fail.
+func TestReadFileAcceptsManifestWithoutDirs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ManifestName)
+
+	old := NewManifest()
+	if err := old.Add(testEntry("a.txt", 3)); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"schema":1,"digest":%q,"files":[{"path":"a.txt","size":3,"mtime":"2026-03-01T12:00:00.123456789Z","sha256":%q}]}`,
+		old.ComputeDigest(), strings.Repeat("ab", 32))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := ReadFile(path)
+	if err != nil {
+		t.Fatalf("a manifest without directory records must still read: %v", err)
+	}
+	if len(m.Dirs) != 0 {
+		t.Fatalf("dirs = %+v, want no directory records", m.Dirs)
+	}
+	if m.Digest != old.ComputeDigest() {
+		t.Fatalf("digest = %q, want %q: adding the field must not change what a file-only manifest hashes", m.Digest, old.ComputeDigest())
+	}
+	if m.Digest != m.ComputeDigest() {
+		t.Fatal("the stored digest must still cover exactly the file records")
+	}
+}
+
 func TestReadFileRejectsUnknownSchema(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -305,12 +503,17 @@ func TestReadFileAcceptsEmptySnapshot(t *testing.T) {
 func TestReadFileRejectsBadManifest(t *testing.T) {
 	digest := strings.Repeat("ab", 32)
 	record := fmt.Sprintf(`{"path":"a.txt","size":1,"mtime":"2026-03-01T12:00:00Z","sha256":%q}`, digest)
+	dirRecord := `{"path":"cache","mtime":"2026-03-01T12:00:00Z","mode":493}`
 
 	tests := []struct {
 		name string
 		body string
 	}{
 		{name: "truncated", body: `{"schema":1,"files":[`},
+		{name: "duplicate directory", body: fmt.Sprintf(`{"schema":1,"dirs":[%s,%s]}`, dirRecord, dirRecord)},
+		{name: "directory with invalid path", body: `{"schema":1,"dirs":[{"path":"../cache","mtime":"2026-03-01T12:00:00Z","mode":493}]}`},
+		{name: "directory mode out of range", body: `{"schema":1,"dirs":[{"path":"cache","mtime":"2026-03-01T12:00:00Z","mode":4095}]}`},
+		{name: "path is both file and directory", body: fmt.Sprintf(`{"schema":1,"files":[%s],"dirs":[{"path":"a.txt","mtime":"2026-03-01T12:00:00Z","mode":493}]}`, record)},
 		{name: "not json", body: "not a manifest"},
 		{name: "empty file", body: ""},
 		{name: "duplicate path", body: fmt.Sprintf(`{"schema":1,"files":[%s,%s]}`, record, record)},
