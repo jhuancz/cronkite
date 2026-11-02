@@ -222,14 +222,15 @@ The contract (environment, exit codes, result reporting) is documented in
 
 ## Status
 
-v0.1.0, the engine and its contract: configuration, safety confinement, cleanup
-tasks, locking, reports, CLI.
+v0.2.0: the engine, four task types, verified backups, scripted maintenance and
+Telegram alerts — with the installers and scheduler wrappers that put it on a
+machine.
 
 | Release | Scope |
 | --- | --- |
 | v0.1.0 | Engine, `logclean`, `tempclean`, lock, safety ceilings, reports, CI |
-| v0.2.0 | `backup` (hardlink snapshots, manifest, verification), `script` task type, Telegram alerts, install and scheduler scripts |
-| v0.3.0 | SMTP alerts, Windows parity verification, scheduling guide, containerized demo |
+| v0.2.0 | `backup` (hardlink snapshots, manifest, verification), `script` task type, Telegram alerts, installers and scheduler wrappers |
+| v0.3.0 | SMTP alerts, full Windows parity verification, containerized demo, directory mtimes on restore |
 
 The roadmap is a sequence of tagged, working releases, not a wishlist: each one
 is tagged only when its scope is complete and its CI is green.
