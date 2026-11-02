@@ -363,7 +363,13 @@ func TestApplyWritesAndVerifiesOneSnapshot(t *testing.T) {
 		t.Fatalf("destination holds %v, want one snapshot", snapshots)
 	}
 
-	snapshot := filepath.Join(dest, snapshots[0])
+	// The writer reports the resolved destination, so a report never names a path it
+	// did not write to; the expected snapshot is resolved the same way.
+	resolvedDest, err := filepath.EvalSymlinks(dest)
+	if err != nil {
+		t.Fatalf("resolve destination: %v", err)
+	}
+	snapshot := filepath.Join(resolvedDest, snapshots[0])
 	for rel, want := range map[string]string{
 		"app.conf":                       "listen=8080\n",
 		filepath.Join("logs", "app.log"): "started\n",

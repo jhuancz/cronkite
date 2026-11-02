@@ -157,15 +157,21 @@ func NewWriter(guard *fsx.Guard, dest string) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve destination %q: %w", dest, err)
 	}
-	if withinFS(source.Dir(), resolve(abs)) {
-		return nil, fmt.Errorf("backup: destination %q is inside source root %q", abs, source.Dir())
+	// One form of the path everywhere: the containment check, the messages, the
+	// report and the directories actually created all use the resolved path, so a
+	// report never names a destination the run did not write to. Windows exposed
+	// this with 8.3 short names (RUNNER~1), where the same directory had two
+	// spellings and only one of them reached the operator.
+	dest = resolve(abs)
+	if withinFS(source.Dir(), dest) {
+		return nil, fmt.Errorf("backup: destination %q is inside source root %q", dest, source.Dir())
 	}
 
 	read, err := os.OpenRoot(source.Dir())
 	if err != nil {
 		return nil, fmt.Errorf("open source root %q for reading: %w", source.Dir(), err)
 	}
-	return &Writer{dest: abs, source: source, read: read, link: os.Link, mode: RelinkChecksum}, nil
+	return &Writer{dest: dest, source: source, read: read, link: os.Link, mode: RelinkChecksum}, nil
 }
 
 // SetRelinkMode selects how strictly a file must be proven unchanged before it

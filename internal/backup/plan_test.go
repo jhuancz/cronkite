@@ -25,7 +25,7 @@ func TestPlanCreatesNothing(t *testing.T) {
 	}
 
 	// Named in UTC, like the snapshot the run would publish.
-	if want := filepath.Join(dest, "20260301T100000Z"); plan.Snapshot != want {
+	if want := filepath.Join(canonicalPath(t, dest), "20260301T100000Z"); plan.Snapshot != want {
 		t.Fatalf("planned snapshot = %q, want %q", plan.Snapshot, want)
 	}
 	if plan.Previous != "" {

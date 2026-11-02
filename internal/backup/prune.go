@@ -73,6 +73,10 @@ type Snapshot struct {
 // directory it cannot account for. A destination that does not exist yet holds
 // no snapshots, which is what the first run of a job sees.
 func Snapshots(dest string) ([]Snapshot, error) {
+	// The writer resolves its destination so a report never names a path it did
+	// not write to; prune has to agree, or a deleted-snapshot path in the report
+	// would differ from the one the snapshot was created with.
+	dest = resolve(dest)
 	abs, err := filepath.Abs(dest)
 	if err != nil {
 		return nil, fmt.Errorf("resolve destination %q: %w", dest, err)

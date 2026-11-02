@@ -607,10 +607,16 @@ func TestBackupTamperedSnapshotFailsVerification(t *testing.T) {
 		t.Fatalf("the run reported no failure for the tampered snapshot")
 	}
 	got := failures[0]
+	// The report names the resolved destination, so a path in it is always one the
+	// run actually wrote to.
+	resolvedDest, err := filepath.EvalSymlinks(dest)
+	if err != nil {
+		t.Fatalf("resolve destination: %v", err)
+	}
 	// The failing entry is the one this run just published: it relinked the tampered
 	// inode, so the new snapshot holds bytes its manifest never recorded.
 	if !strings.Contains(filepath.ToSlash(got.Path), "/logs/app.log") ||
-		!strings.HasPrefix(filepath.ToSlash(got.Path), filepath.ToSlash(dest)+"/") {
+		!strings.HasPrefix(filepath.ToSlash(got.Path), filepath.ToSlash(resolvedDest)+"/") {
 		t.Errorf("failure names %q, want the tampered path in the snapshot published inside %s", got.Path, dest)
 	}
 	if !strings.Contains(got.Error, "does not match its manifest") {

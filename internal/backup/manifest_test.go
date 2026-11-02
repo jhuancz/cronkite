@@ -355,9 +355,6 @@ func TestManifestDigestCoversDirectories(t *testing.T) {
 		"directory removed":      func(m *Manifest) { m.Dirs = nil },
 		"directory path changed": func(m *Manifest) { m.Dirs[0].Path = "cache2" },
 		"directory mode changed": func(m *Manifest) { m.Dirs[0].Mode = 0o700 },
-		"directory mtime changed": func(m *Manifest) {
-			m.Dirs[0].ModTime = m.Dirs[0].ModTime.Add(time.Second)
-		},
 	}
 	for name, change := range changes {
 		t.Run(name, func(t *testing.T) {
@@ -367,6 +364,16 @@ func TestManifestDigestCoversDirectories(t *testing.T) {
 				t.Fatalf("changing the %s must change the digest", name)
 			}
 		})
+	}
+
+	// A directory's timestamp is recorded but is not part of the tree's identity:
+	// no restore reproduces it, and folding it in made two snapshots of an
+	// unchanged tree disagree on Windows, where a directory's mtime moves for
+	// reasons outside cronkite's control.
+	stamped := base()
+	stamped.Dirs[0].ModTime = stamped.Dirs[0].ModTime.Add(time.Hour)
+	if stamped.ComputeDigest() != reference {
+		t.Fatal("a directory mtime must not change the digest")
 	}
 
 	dirsOnly := NewManifest()

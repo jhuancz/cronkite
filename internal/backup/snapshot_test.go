@@ -18,6 +18,25 @@ import (
 
 var firstRun = time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
 
+// canonicalPath resolves the deepest existing part of p, matching what the writer
+// reports after it canonicalizes its destination.
+func canonicalPath(t *testing.T, p string) string {
+	t.Helper()
+	cur := p
+	var tail []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(append([]string{resolved}, tail...)...)
+		}
+		parent, base := filepath.Split(filepath.Clean(cur))
+		if base == "" || parent == cur {
+			return p
+		}
+		tail = append([]string{base}, tail...)
+		cur = filepath.Clean(parent)
+	}
+}
+
 func writeSourceFile(t *testing.T, dir, rel, content string) string {
 	t.Helper()
 	path := filepath.Join(dir, filepath.FromSlash(rel))
@@ -106,7 +125,10 @@ func TestWriteCopiesFirstSnapshot(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if want := filepath.Join(dest, "20260301T100000Z"); res.Snapshot != want {
+	// The writer reports the resolved destination, so a report never names a path
+	// it did not write to; compare against the resolved form for the same reason.
+	want := canonicalPath(t, dest)
+	if want = filepath.Join(want, "20260301T100000Z"); res.Snapshot != want {
 		t.Fatalf("snapshot = %q, want %q", res.Snapshot, want)
 	}
 	if res.Copied != 3 || res.Relinked != 0 {

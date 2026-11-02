@@ -202,7 +202,13 @@ func (m *Manifest) ComputeDigest() string {
 		// file record can never be read as a directory record. A manifest without
 		// directory records hashes exactly the bytes it hashed before this field
 		// existed, so an older manifest still verifies against its own records.
-		fmt.Fprintf(h, "\x00dir\x00%s\x00%o\x00%d\n", d.Path, d.Mode, d.ModTime.UTC().UnixNano())
+		//
+		// The mode is part of the tree's identity because a restore reproduces it.
+		// The directory mtime is not: cronkite never applies it back (writing the
+		// children moves it anyway), so folding it into the digest made two
+		// snapshots of an unchanged tree disagree for a value the tool does not
+		// deliver - which is what Windows exposed.
+		fmt.Fprintf(h, "\x00dir\x00%s\x00%o\n", d.Path, d.Mode)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
