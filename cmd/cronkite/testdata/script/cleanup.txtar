@@ -1,0 +1,30 @@
+# A rehearsal must never change the filesystem, and a real run must remove
+# exactly the files past the retention window.
+
+touchold logs/old.log 90d
+cronkite plan -config cronkite.yaml
+stdout 'would remove'
+exists logs/old.log
+exists logs/recent.log
+exists state/reports/latest.json
+
+cronkite run -config cronkite.yaml -apply
+stdout 'removed'
+! exists logs/old.log
+exists logs/recent.log
+
+-- cronkite.yaml --
+version: 1
+run:
+  state_dir: $WORK/state
+tasks:
+  - name: logs
+    type: logclean
+    roots: [$WORK/logs]
+    older_than: 30d
+-- logs/old.log --
+an old log line
+-- logs/recent.log --
+a recent log line
+-- logs/nested/deep/old.log --
+an old log line, one level deeper

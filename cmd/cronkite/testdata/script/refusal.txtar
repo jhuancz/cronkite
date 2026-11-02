@@ -1,0 +1,40 @@
+# When the plan exceeds the safety ceiling the run must refuse before deleting
+# anything, and say so instead of failing silently.
+
+touchold logs/one.log 90d
+touchold logs/two.log 90d
+touchold logs/three.log 90d
+
+! cronkite run -config cronkite.yaml -apply
+stdout 'refusing to run'
+stdout 'max_delete_files'
+
+exists logs/one.log
+exists logs/two.log
+exists logs/three.log
+
+# The same run succeeds once the ceiling allows it, which proves the refusal was
+# caused by the ceiling and not by a broken configuration.
+cronkite run -config cronkite.yaml -apply -force
+stdout 'bypassed'
+! exists logs/one.log
+! exists logs/two.log
+! exists logs/three.log
+
+-- cronkite.yaml --
+version: 1
+run:
+  state_dir: $WORK/state
+  safety:
+    max_delete_files: 2
+tasks:
+  - name: logs
+    type: logclean
+    roots: [$WORK/logs]
+    older_than: 30d
+-- logs/one.log --
+1
+-- logs/two.log --
+2
+-- logs/three.log --
+3

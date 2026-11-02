@@ -1,0 +1,30 @@
+# Protect patterns must survive a real run, and protecting a directory must
+# protect its whole subtree.
+
+touchold logs/drop.log 90d
+touchold logs/keep.log 90d
+touchold logs/keepdir/old.log 90d
+
+cronkite run -config cronkite.yaml -apply
+! exists logs/drop.log
+exists logs/keep.log
+exists logs/keepdir/old.log
+stdout 'protected'
+
+-- cronkite.yaml --
+version: 1
+run:
+  state_dir: $WORK/state
+tasks:
+  - name: logs
+    type: logclean
+    roots: [$WORK/logs]
+    older_than: 30d
+    protect:
+      - "keep*"
+-- logs/drop.log --
+delete me
+-- logs/keep.log --
+keep me
+-- logs/keepdir/old.log --
+keep me too
