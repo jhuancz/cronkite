@@ -38,10 +38,16 @@ var (
 
 // Task writes one snapshot per run and prunes the older ones by policy.
 type Task struct {
-	name   string
-	dest   string
-	policy snapshot.PrunePolicy
-	verify int
+	name string
+	dest string
+	// sourceLabel is the root as the operator wrote it. Notes name the source and
+	// the destination the way the configuration does, because a rehearsal happens
+	// before the destination exists: on Windows the resolved form of a directory
+	// that does not exist yet is the 8.3 short name, and a note that mixed that
+	// with the long form of the source described one run in two spellings.
+	sourceLabel string
+	policy      snapshot.PrunePolicy
+	verify      int
 	// maxBytes is the ceiling on the bytes one run may copy. Relinked bytes are
 	// not charged against it: they cost no disk, so counting them would refuse
 	// the incremental run this task exists to take.
@@ -86,6 +92,7 @@ func New(cfg config.Task) (*Task, error) {
 		return nil, fmt.Errorf("task %s: no source root is available here; a backup needs a source tree", cfg.Name)
 	}
 
+	sourceLabel := cfg.Roots[0]
 	writer, err := snapshot.NewWriter(guard, cfg.Destination)
 	if err != nil {
 		guard.Close()
@@ -108,13 +115,14 @@ func New(cfg config.Task) (*Task, error) {
 	}
 
 	return &Task{
-		name:     cfg.Name,
-		dest:     cfg.Destination,
-		policy:   snapshot.PrunePolicy{Daily: daily, Weekly: weekly},
-		verify:   verify,
-		maxBytes: maxBytes,
-		guard:    guard,
-		writer:   writer,
+		name:        cfg.Name,
+		dest:        cfg.Destination,
+		sourceLabel: sourceLabel,
+		policy:      snapshot.PrunePolicy{Daily: daily, Weekly: weekly},
+		verify:      verify,
+		maxBytes:    maxBytes,
+		guard:       guard,
+		writer:      writer,
 	}, nil
 }
 
@@ -188,7 +196,7 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 	// counts behind them, which is what an operator budgets against.
 	plan.Notes = append(plan.Notes, fmt.Sprintf(
 		"a run would publish one snapshot of %s in %s, holding %d files (%s): %d to copy (%s), %d to relink (%s)",
-		source, t.dest, rehearsal.Files(), bytesx.Format(rehearsal.BytesCopied+rehearsal.BytesRelinked),
+		t.sourceLabel, t.dest, rehearsal.Files(), bytesx.Format(rehearsal.BytesCopied+rehearsal.BytesRelinked),
 		rehearsal.Copied, bytesx.Format(rehearsal.BytesCopied),
 		rehearsal.Relinked, bytesx.Format(rehearsal.BytesRelinked)))
 	if rehearsal.Previous == "" {
