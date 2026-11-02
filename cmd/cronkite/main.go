@@ -162,9 +162,14 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	}
 
 	problems := 0
+	warnings := 0
 	note := func(format string, argsValue ...any) {
 		problems++
 		fmt.Fprintf(stdout, "  FAIL  "+format+"\n", argsValue...)
+	}
+	warn := func(format string, argsValue ...any) {
+		warnings++
+		fmt.Fprintf(stdout, "  WARN  "+format+"\n", argsValue...)
 	}
 	ok := func(format string, argsValue ...any) {
 		fmt.Fprintf(stdout, "  ok    "+format+"\n", argsValue...)
@@ -186,24 +191,40 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 			ok("task %s: disabled", task.Name)
 			continue
 		}
+		for _, unset := range task.UnresolvedRoots {
+			warn("task %s: root %q depends on a variable that is not set here; it will be skipped", task.Name, unset)
+		}
+
+		usable := 0
 		for _, root := range task.Roots {
 			info, err := os.Stat(root)
 			switch {
 			case errors.Is(err, os.ErrNotExist):
-				note("task %s: root %s does not exist", task.Name, root)
+				warn("task %s: root %s does not exist; it will be skipped", task.Name, root)
 			case err != nil:
 				note("task %s: root %s: %v", task.Name, root, err)
 			case !info.IsDir():
 				note("task %s: root %s is not a directory", task.Name, root)
 			default:
 				ok("task %s: root %s", task.Name, root)
+				usable++
 			}
+		}
+		// One missing root is normal in a cross-platform file. Every root
+		// missing means the task is dead weight and the operator should know.
+		if usable == 0 && len(task.Roots) > 0 {
+			note("task %s: no configured root exists, so this task can never do anything", task.Name)
 		}
 	}
 
 	if problems > 0 {
-		fmt.Fprintf(stdout, "\n%d problem(s) found\n", problems)
+		fmt.Fprintf(stdout, "\n%d problem(s) and %d warning(s); fix the problems before scheduling this run\n", problems, warnings)
 		return exitcode.Error
+	}
+	if warnings > 0 {
+		fmt.Fprintf(stdout, "\nconfiguration is valid, with %d warning(s). skipped roots are recorded in every run report. available task types: %s\n",
+			warnings, strings.Join(tasks.Types, ", "))
+		return exitcode.OK
 	}
 	fmt.Fprintf(stdout, "\nconfiguration is valid; available task types: %s\n", strings.Join(tasks.Types, ", "))
 	return exitcode.OK

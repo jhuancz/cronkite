@@ -40,13 +40,14 @@ var presets = map[string]preset{
 
 // Task removes files older than a retention window under confined roots.
 type Task struct {
-	name      string
-	typ       string
-	older     time.Duration
-	olderText string
-	maxDepth  int
-	rmDirs    bool
-	guard     *fsx.Guard
+	name       string
+	typ        string
+	older      time.Duration
+	olderText  string
+	maxDepth   int
+	rmDirs     bool
+	guard      *fsx.Guard
+	unresolved []string
 }
 
 // New validates the task configuration and opens its roots.
@@ -89,6 +90,7 @@ func New(cfg config.Task) (*Task, error) {
 		return nil, fmt.Errorf("task %s: %w", cfg.Name, err)
 	}
 	t.guard = guard
+	t.unresolved = cfg.UnresolvedRoots
 	return t, nil
 }
 
@@ -108,6 +110,9 @@ func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 	plan := &task.Plan{}
 	cutoff := env.Now.Add(-t.older)
 
+	for _, unset := range t.unresolved {
+		plan.Notes = append(plan.Notes, fmt.Sprintf("root %q is not defined in this environment; skipped", unset))
+	}
 	for _, missing := range t.guard.Missing() {
 		plan.Notes = append(plan.Notes, "root does not exist: "+missing)
 	}

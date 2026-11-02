@@ -172,6 +172,48 @@ func TestInvalidConfigurationIsReported(t *testing.T) {
 	}
 }
 
+// TestCheckToleratesCrossPlatformRoots covers the shared configuration case: a
+// root for the other platform must warn, not fail.
+func TestCheckToleratesCrossPlatformRoots(t *testing.T) {
+	existing := t.TempDir()
+	cfgPath := writeConfig(t, fmt.Sprintf(`
+version: 1
+run:
+  state_dir: %s
+tasks:
+  - name: temp
+    type: tempclean
+    roots:
+      - %s
+      - "%%CRONKITE_NOT_SET_ANYWHERE%%"
+`, filepath.Join(t.TempDir(), "state"), existing))
+
+	code, stdout, stderr := runCLI("check", "-config", cfgPath)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "WARN") {
+		t.Errorf("stdout should warn about the unset root, got:\n%s", stdout)
+	}
+}
+
+func TestCheckFailsWhenNoRootExists(t *testing.T) {
+	cfgPath := writeConfig(t, fmt.Sprintf(`
+version: 1
+run:
+  state_dir: %s
+tasks:
+  - name: logs
+    type: logclean
+    roots: [%s]
+`, filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "gone")))
+
+	code, _, _ := runCLI("check", "-config", cfgPath)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
 func TestJSONReportIsMachineReadable(t *testing.T) {
 	logs := t.TempDir()
 	cfgPath := writeConfig(t, fmt.Sprintf(`

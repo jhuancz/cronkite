@@ -85,6 +85,12 @@ type Task struct {
 	MaxDepth        *int     `yaml:"max_depth"`
 	RemoveEmptyDirs *bool    `yaml:"remove_empty_dirs"`
 	Protect         []string `yaml:"protect"`
+
+	// UnresolvedRoots holds roots whose path depends on an environment
+	// variable that is not set here. One configuration is meant to be shared
+	// between Linux and Windows, so "%TEMP%" on Linux is inapplicable rather
+	// than invalid.
+	UnresolvedRoots []string `yaml:"-"`
 }
 
 // IsEnabled reports whether the task should run. Absent means enabled.
@@ -218,22 +224,27 @@ func (c *Config) normalize() error {
 		if t.Type == "" {
 			add("%s: type is required", where)
 		}
-		if len(t.Roots) == 0 {
-			add("%s: roots is required", where)
-		}
 		expanded := make([]string, 0, len(t.Roots))
 		for _, root := range t.Roots {
-			root = expand(root)
 			if root == "" {
 				add("%s: roots contains an empty path", where)
 				continue
 			}
-			if !filepath.IsAbs(root) {
-				add("%s: root %q must be absolute", where, root)
+			resolved := expand(root)
+			if resolved == "" {
+				t.UnresolvedRoots = append(t.UnresolvedRoots, root)
+				continue
 			}
-			expanded = append(expanded, root)
+			if !filepath.IsAbs(resolved) {
+				add("%s: root %q must be absolute", where, resolved)
+				continue
+			}
+			expanded = append(expanded, resolved)
 		}
 		t.Roots = expanded
+		if len(t.Roots) == 0 && len(t.UnresolvedRoots) == 0 {
+			add("%s: roots is required", where)
+		}
 
 		if t.OlderThan != "" {
 			d, err := durationx.Parse(t.OlderThan)

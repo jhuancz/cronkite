@@ -135,6 +135,44 @@ tasks:
 	}
 }
 
+// TestUnsetVariableInRootIsInapplicable covers one configuration shared between
+// Linux and Windows: "%TEMP%" cannot be an error on a machine that has no
+// TEMP variable, and it must not be treated as a root either.
+func TestUnsetVariableInRootIsInapplicable(t *testing.T) {
+	t.Setenv("CRONKITE_SET_ROOT", t.TempDir())
+	cfg, err := Parse([]byte(`
+version: 1
+tasks:
+  - name: temp
+    type: tempclean
+    roots:
+      - $CRONKITE_SET_ROOT
+      - "%CRONKITE_TEMP_VAR_THAT_IS_NOT_SET%"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Tasks[0].Roots) != 1 {
+		t.Errorf("roots = %v, want only the resolved one", cfg.Tasks[0].Roots)
+	}
+	if len(cfg.Tasks[0].UnresolvedRoots) != 1 {
+		t.Errorf("unresolved = %v, want the unset variable", cfg.Tasks[0].UnresolvedRoots)
+	}
+}
+
+func TestAllRootsUnsetIsStillAnError(t *testing.T) {
+	_, err := Parse([]byte(`
+version: 1
+tasks:
+  - name: temp
+    type: tempclean
+    roots: []
+`))
+	if err == nil || !strings.Contains(err.Error(), "roots is required") {
+		t.Fatalf("expected a roots problem, got: %v", err)
+	}
+}
+
 func TestUnknownNotifyEventIsRejected(t *testing.T) {
 	_, err := Parse([]byte(`
 version: 1
