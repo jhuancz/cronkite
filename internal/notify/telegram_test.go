@@ -218,3 +218,23 @@ func TestTokenAbsentFromEncodedReport(t *testing.T) {
 		t.Error("the encoded report carries the token")
 	}
 }
+
+// A body over the Bot API limit is rejected outright, so truncating is the
+// difference between a shortened alert and no alert at all.
+func TestClampTextStopsBeforeTheAPILimit(t *testing.T) {
+	long := strings.Repeat("a failed task name; ", 400)
+	if len(long) <= telegramMaxText {
+		t.Fatalf("the fixture must exceed the limit, it is %d bytes", len(long))
+	}
+	got := clampText(long)
+	if len(got) > telegramMaxText {
+		t.Fatalf("clamped text is %d bytes, above the %d limit", len(got), telegramMaxText)
+	}
+	if !strings.HasSuffix(got, "(truncated)") || !strings.HasPrefix(got, "a failed task name;") {
+		t.Fatalf("the clamp must keep the beginning and say it cut: %q", got[len(got)-40:])
+	}
+	// A message inside the limit is untouched.
+	if short := "cronkite: ok"; clampText(short) != short {
+		t.Fatal("a short message must not be rewritten")
+	}
+}

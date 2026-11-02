@@ -14,7 +14,40 @@ import (
 // window is exercised without sleeping.
 func throttleAt(t *testing.T, path string, window time.Duration, now *time.Time) *Throttle {
 	t.Helper()
-	return NewThrottle(path, window, func() time.Time { return *now })
+	return NewThrottle(path, window, "telegram:test", func() time.Time { return *now })
+}
+
+// Two destinations sharing one state directory must not share a window: an alert
+// delivered to one chat says nothing about what another chat received.
+func TestThrottleIsPerChannelNotPerStateDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notify-state.json")
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	window := 15 * time.Minute
+
+	first := NewThrottle(path, window, "telegram:111", clock)
+	if first.Suppressed(report.StatusFailed) {
+		t.Fatal("nothing has been sent yet")
+	}
+	if err := first.Record(report.StatusFailed); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	other := NewThrottle(path, window, "telegram:222", clock)
+	if other.Suppressed(report.StatusFailed) {
+		t.Fatal("a second chat must receive its own alert")
+	}
+
+	// Recording the second channel must not forget the first.
+	if err := other.Record(report.StatusFailed); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if !NewThrottle(path, window, "telegram:111", clock).Suppressed(report.StatusFailed) {
+		t.Fatal("the first channel's window was lost when the second was recorded")
+	}
+	if !NewThrottle(path, window, "telegram:222", clock).Suppressed(report.StatusFailed) {
+		t.Fatal("the second channel's window was not recorded")
+	}
 }
 
 func TestThrottleSuppressesARepeatInsideTheWindow(t *testing.T) {
@@ -94,19 +127,30 @@ func TestThrottleStateIsASmallJSONFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read state: %v", err)
 	}
-	var state map[string]json.RawMessage
-	if err := json.Unmarshal(data, &state); err != nil {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("the state must be JSON: %v", err)
 	}
-	if len(state) != 2 {
-		t.Fatalf("state = %s, want exactly status and sent_at", data)
+	if len(doc) != 1 || doc["channels"] == nil {
+		t.Fatalf("state = %s, want exactly one channels object", data)
+	}
+	var channels map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(doc["channels"], &channels); err != nil {
+		t.Fatalf("channels must be an object: %v", err)
+	}
+	if len(channels) != 1 {
+		t.Fatalf("channels = %s, want exactly one entry", doc["channels"])
+	}
+	record, ok := channels["telegram:test"]
+	if !ok || len(record) != 2 {
+		t.Fatalf("state = %s, want telegram:test with exactly status and sent_at", data)
 	}
 	var status report.Status
-	if err := json.Unmarshal(state["status"], &status); err != nil || status != report.StatusFailed {
+	if err := json.Unmarshal(record["status"], &status); err != nil || status != report.StatusFailed {
 		t.Errorf("stored status = %q (%v), want failed", status, err)
 	}
 	var sentAt time.Time
-	if err := json.Unmarshal(state["sent_at"], &sentAt); err != nil || !sentAt.Equal(now) {
+	if err := json.Unmarshal(record["sent_at"], &sentAt); err != nil || !sentAt.Equal(now) {
 		t.Errorf("stored sent_at = %s (%v), want %s", sentAt, err, now)
 	}
 

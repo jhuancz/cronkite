@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -621,5 +622,37 @@ func TestBackupTamperedSnapshotFailsVerification(t *testing.T) {
 	}
 	if !strings.Contains(got.Error, "does not match its manifest") {
 		t.Errorf("failure error = %q, want it to say what did not match", got.Error)
+	}
+}
+
+// check must catch what the configuration file cannot show: a task that cannot be
+// built is a run that will fail at 03:30. An interpreter that is not installed is
+// the portable example - powershell exists on Windows and nowhere else.
+func TestCheckBuildsEveryTask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("powershell exists on Windows, so it cannot stand in for a missing interpreter")
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "maint.ps1")
+	if err := os.WriteFile(scriptPath, []byte("Write-Output hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, fmt.Sprintf(`
+version: 1
+run:
+  state_dir: %s
+tasks:
+  - name: maint
+    type: script
+    interpreter: powershell
+    file: %s
+`, filepath.Join(dir, "state"), scriptPath))
+
+	code, stdout, _ := runCLI("check", "-config", cfgPath)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1: a task that cannot be built must fail the check", code)
+	}
+	if !strings.Contains(stdout, "task maint") || !strings.Contains(stdout, "powershell") {
+		t.Errorf("stdout should name the task and the interpreter, got:\n%s", stdout)
 	}
 }

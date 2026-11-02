@@ -215,6 +215,20 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 		if usable == 0 && len(task.Roots) > 0 {
 			note("task %s: no configured root exists, so this task can never do anything", task.Name)
 		}
+
+		// Build the task, which is what a run does before it touches anything. It
+		// is the only way to catch what the file cannot show: an interpreter that
+		// is not installed, a destination that cannot be opened. Discovering that
+		// at 03:30 is the failure this command exists to prevent.
+		runner, buildErr := tasks.Build(task)
+		if buildErr != nil {
+			// The constructor already names the task; prefixing it again reads as a
+			// stutter in the one message an operator has to act on.
+			note("%v", buildErr)
+			continue
+		}
+		_ = runner.Close()
+		ok("task %s: can be built", task.Name)
 	}
 
 	if problems > 0 {

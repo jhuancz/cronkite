@@ -48,7 +48,10 @@ func notifyRun(ctx context.Context, cfg *config.Config, rep *report.Report, send
 		return false
 	}
 
-	throttle := notify.NewThrottle(notify.StatePath(cfg.Run.StateDir), cfg.NotifyThrottle(), nil)
+	// The channel identifies the destination, not the directory: two chats sharing
+	// a state directory must not share a window.
+	channel := "telegram:" + cfg.Notify.Telegram.ChatID
+	throttle := notify.NewThrottle(notify.StatePath(cfg.Run.StateDir), cfg.NotifyThrottle(), channel, nil)
 	if throttle.Suppressed(rep.Status) {
 		rep.Notes = append(rep.Notes, fmt.Sprintf(
 			"notify: a repeat of status %s inside notify.throttle (%s) was suppressed; a worse outcome would have been sent",

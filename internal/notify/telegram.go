@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultBaseURL is the Bot API endpoint. Production traffic is HTTPS only,
@@ -110,7 +111,7 @@ func (t *Telegram) Send(ctx context.Context, m Message) error {
 
 	payload, err := json.Marshal(sendMessage{
 		ChatID:                t.chatID,
-		Text:                  m.Text(),
+		Text:                  clampText(m.Text()),
 		DisableWebPagePreview: true,
 	})
 	if err != nil {
@@ -189,6 +190,26 @@ func describeAPI(api apiResponse) string {
 		return api.Description
 	}
 	return "the API answered ok=false without a description"
+}
+
+// telegramMaxText is the Bot API limit for one message body. A longer body is
+// rejected outright, so a run with many failed tasks would silence the very alert
+// it was trying to send: truncating keeps the beginning - the status and the first
+// failures - which is what a reader acts on.
+const telegramMaxText = 4096
+
+// clampText shortens a message to the API limit, cutting on a rune boundary and
+// saying that it did.
+func clampText(s string) string {
+	if len(s) <= telegramMaxText {
+		return s
+	}
+	const marker = "\n... (truncated)"
+	cut := telegramMaxText - len(marker)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker
 }
 
 // secretError hides a token inside the message of the error it wraps. Unwrap is

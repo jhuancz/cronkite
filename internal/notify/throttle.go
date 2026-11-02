@@ -15,26 +15,37 @@ import (
 // The memory is one small JSON file in the state directory, because the process
 // that sent the last alert is usually gone by the time the next run starts.
 type Throttle struct {
-	path   string
-	window time.Duration
-	now    func() time.Time
+	path    string
+	window  time.Duration
+	now     func() time.Time
+	channel string
 }
 
-// throttleState is the on-disk record: the last status that was delivered, and
-// when. Nothing else is stored - a token, a chat id or a run id here would be a
-// secret on disk or a record that grows without bound.
+// throttleState is the on-disk record, keyed by channel: the last status that was
+// delivered to that channel, and when.
+//
+// Keyed by channel and not by state directory because one state directory can
+// describe more than one destination - two chats, a chat and a webhook - and a
+// window shared between them would silence an alert nobody received. Nothing else
+// is stored: a token or a run id here would be a secret on disk or a record that
+// grows without bound.
 type throttleState struct {
+	Channels map[string]channelRecord `json:"channels"`
+}
+
+// channelRecord is what was last delivered to one channel.
+type channelRecord struct {
 	Status report.Status `json:"status"`
 	SentAt time.Time     `json:"sent_at"`
 }
 
 // NewThrottle returns a throttle backed by path. A nil clock means time.Now;
 // tests move the clock instead of sleeping.
-func NewThrottle(path string, window time.Duration, now func() time.Time) *Throttle {
+func NewThrottle(path string, window time.Duration, channel string, now func() time.Time) *Throttle {
 	if now == nil {
 		now = time.Now
 	}
-	return &Throttle{path: path, window: window, now: now}
+	return &Throttle{path: path, window: window, now: now, channel: channel}
 }
 
 // Suppressed reports whether a message for status would only repeat what the
@@ -51,16 +62,22 @@ func (t *Throttle) Suppressed(status report.Status) bool {
 	if err != nil {
 		return false
 	}
-	if SeverityOf(status) > SeverityOf(state.Status) {
+	last, ok := state.Channels[t.channel]
+	if !ok {
+		// Nothing has been delivered to this channel yet, whatever was delivered
+		// to the others in the same state directory.
 		return false
 	}
-	if state.Status != status {
+	if SeverityOf(status) > SeverityOf(last.Status) {
+		return false
+	}
+	if last.Status != status {
 		return false
 	}
 	if t.window <= 0 {
 		return false
 	}
-	return t.now().UTC().Sub(state.SentAt) < t.window
+	return t.now().UTC().Sub(last.SentAt) < t.window
 }
 
 // Record stores status and the current time as the last delivered message.
@@ -73,7 +90,16 @@ func (t *Throttle) Record(status report.Status) error {
 			return fmt.Errorf("create notify state directory: %w", err)
 		}
 	}
-	return writeThrottleState(t.path, throttleState{Status: status, SentAt: t.now().UTC()})
+	// Read-modify-write: recording one channel must not forget the others.
+	state, err := readThrottleState(t.path)
+	if err != nil {
+		state = throttleState{}
+	}
+	if state.Channels == nil {
+		state.Channels = map[string]channelRecord{}
+	}
+	state.Channels[t.channel] = channelRecord{Status: status, SentAt: t.now().UTC()}
+	return writeThrottleState(t.path, state)
 }
 
 // readThrottleState decodes the state file. A missing file is an error too: the
