@@ -279,3 +279,36 @@ func skippedFor(res *Result, reason string) bool {
 	}
 	return false
 }
+
+// A file edited inside a published snapshot must never be relinked: the new
+// snapshot would inherit bytes that do not match the digest it records.
+func TestRelinkRefusesTamperedPreviousFile(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, "a.txt", "alpha")
+
+	w := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "d"))
+	first, err := w.Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	tampered := filepath.Join(first.Snapshot, "a.txt")
+	if err := os.WriteFile(tampered, []byte("ALPHA-TAMPERED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := w.Write(context.Background(), firstRun.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if second.Relinked != 0 || second.Copied != 1 {
+		t.Fatalf("copied=%d relinked=%d, want the tampered file copied again", second.Copied, second.Relinked)
+	}
+	content, err := os.ReadFile(filepath.Join(second.Snapshot, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "alpha" {
+		t.Fatalf("snapshot content = %q, want the source content", content)
+	}
+}

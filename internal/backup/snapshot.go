@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jhuancz/cronkite/internal/fsx"
 )
@@ -214,7 +215,22 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		}
 	}()
 
+	// Resolved once, not per file: the operating system may address the same
+	// directory through a symlinked ancestor (macOS /var is /private/var), and the
+	// containment check for a relink target has to compare real paths.
+	prevResolved := prevDir
+	if prevDir != "" {
+		if resolved, err := filepath.EvalSymlinks(prevDir); err == nil {
+			prevResolved = resolved
+		}
+	}
+
 	manifest := NewManifest()
+	// Directories whose entry list changed, so each one can be flushed before the
+	// snapshot is published: syncing only the stage root would leave nested
+	// entries vulnerable to a power loss that the manifest no longer matches.
+	touchedDirs := map[string]struct{}{}
+	var dirsToSync []string
 	walkErr := w.source.Walk(0, func(abs, rel string, d fs.DirEntry) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -244,9 +260,10 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		case !d.Type().IsRegular():
 			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRegular})
 			return nil
-		case strings.ContainsRune(relSlash, '\\'):
-			// Skipping one name the manifest cannot represent beats failing every
-			// backup, and the report says which file was left out.
+		case !representable(relSlash):
+			// The manifest refuses some names on purpose, so the walk has to
+			// refuse them first: one legacy file name must cost that file, never
+			// every snapshot this task will ever write.
 			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRepresentable})
 			return nil
 		}
@@ -261,18 +278,19 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", filepath.Dir(dst), err)
 		}
+		for dir := filepath.Dir(dst); dir != stage && within(stage, dir); dir = filepath.Dir(dir) {
+			if _, seen := touchedDirs[dir]; !seen {
+				touchedDirs[dir] = struct{}{}
+				dirsToSync = append(dirsToSync, dir)
+			}
+		}
 		entry := Entry{Path: relSlash, Size: info.Size(), ModTime: info.ModTime().UTC()}
 
 		// Incrementality is decided from the manifest, not from the source: a
 		// file whose size and mtime match the previous record, and which is
 		// still there, is the same bytes with the same digest.
 		if shared, ok := prev.Lookup(relSlash); ok && w.relinkable(relSlash, shared, entry) {
-			target := filepath.Join(prevDir, filepath.FromSlash(relSlash))
-			// The target must still be a regular file. A symlink or a directory
-			// sitting where the previous snapshot should hold a file means that
-			// snapshot was tampered with, and linking it would pull content from
-			// outside the configured root into a published snapshot.
-			if info, err := os.Lstat(target); err == nil && info.Mode().IsRegular() {
+			if target, ok := relinkTarget(prevResolved, relSlash, shared); ok {
 				err := w.link(target, dst)
 				if err == nil {
 					res.Relinked++
@@ -310,7 +328,15 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	}
 	// Durability, not only atomicity: without these the rename could survive a
 	// power loss while the data behind it did not, leaving a directory that looks
-	// like a complete snapshot and is not.
+	// like a complete snapshot and is not. Deepest first, then the stage root.
+	sort.Slice(dirsToSync, func(i, j int) bool {
+		return strings.Count(dirsToSync[i], string(filepath.Separator)) > strings.Count(dirsToSync[j], string(filepath.Separator))
+	})
+	for _, dir := range dirsToSync {
+		if err := syncDir(dir); err != nil {
+			return res, fmt.Errorf("flush snapshot directory %s: %w", dir, err)
+		}
+	}
 	if err := syncDir(stage); err != nil {
 		return res, fmt.Errorf("flush snapshot directory %s: %w", stage, err)
 	}
@@ -487,8 +513,55 @@ func (w *Writer) digestFile(rel string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// representable reports whether a source name can be written into a portable
+// manifest. Whatever the manifest would refuse has to be skipped here, because
+// a name it refuses would otherwise abort the whole snapshot.
+func representable(rel string) bool {
+	if !utf8.ValidString(rel) || strings.ContainsRune(rel, '\\') {
+		return false
+	}
+	return !(path.Dir(rel) == "." && rel == ":")
+}
+
+// relinkTarget returns the previous snapshot file that may supply this entry, or
+// false when the previous snapshot cannot be trusted to hold it.
+//
+// Three things are checked, and each one closes a way for content to enter a
+// published snapshot that was never in the source:
+//   - the entry is a regular file (a planted symlink or a directory is refused);
+//   - it resolves inside the previous snapshot, which a symlinked intermediate
+//     directory would otherwise break, since Lstat does not inspect ancestors;
+//   - its size and mtime still match the record whose digest we are about to
+//     reuse, so a file edited inside a published snapshot is copied instead.
+func relinkTarget(prevResolvedDir, rel string, shared Entry) (string, bool) {
+	target := filepath.Join(prevResolvedDir, filepath.FromSlash(rel))
+	info, err := os.Lstat(target)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil || !within(prevResolvedDir, resolved) {
+		return "", false
+	}
+	// Compared at second resolution: filesystems store timestamps with varying
+	// precision, and a nanosecond that was truncated on write must not be read as
+	// tampering. A rewrite still moves the seconds, so the guard keeps working.
+	if info.Size() != shared.Size ||
+		!info.ModTime().Truncate(time.Second).Equal(shared.ModTime.Truncate(time.Second)) {
+		return "", false
+	}
+	return target, true
+}
+
 // syncDir flushes a directory's entries to stable storage.
 func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		// Windows has no directory fsync: FlushFileBuffers needs a writable
+		// handle and fails with access denied on a directory opened read-only, so
+		// insisting on it would refuse every snapshot on that platform. NTFS
+		// journals the metadata instead.
+		return nil
+	}
 	f, err := os.Open(dir)
 	if err != nil {
 		return err

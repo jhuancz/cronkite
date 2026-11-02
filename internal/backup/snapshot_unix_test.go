@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestWriteSkipsNonRegularFiles covers devices, sockets and FIFOs. They are
@@ -62,5 +63,64 @@ func TestWriteSkipsBackslashName(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(res.Snapshot, "ok.txt")); err != nil {
 		t.Errorf("the rest of the tree must still be backed up: %v", err)
+	}
+}
+
+// A legal Unix file name that JSON cannot carry must cost that file, not the
+// whole snapshot.
+func TestWriteSkipsInvalidUTF8Name(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "log-\xff.txt"), []byte("x"), 0o600); err != nil {
+		t.Skipf("filesystem refuses non-UTF-8 names: %v", err)
+	}
+	writeSourceFile(t, src, "ok.txt", "ok")
+
+	res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "d")).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("one unrepresentable name must not abort the snapshot: %v", err)
+	}
+	if !skippedFor(res, ReasonNotRepresentable) {
+		t.Fatalf("expected a %s skip, got %+v", ReasonNotRepresentable, res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(res.Snapshot, "ok.txt")); err != nil {
+		t.Errorf("the rest of the tree must still be backed up: %v", err)
+	}
+}
+
+// A symlinked directory inside the previous snapshot would redirect the relink
+// target outside it, pulling an unrelated file into the published snapshot.
+func TestRelinkRefusesSymlinkedPreviousDirectory(t *testing.T) {
+	src := t.TempDir()
+	writeSourceFile(t, src, filepath.Join("sub", "a.txt"), "alpha")
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "a.txt"), []byte("TOPSECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "d"))
+	first, err := w.Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	previousSub := filepath.Join(first.Snapshot, "sub")
+	if err := os.RemoveAll(previousSub); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, previousSub); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	second, err := w.Write(context.Background(), firstRun.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(second.Snapshot, "sub", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "alpha" {
+		t.Fatalf("snapshot content = %q, want the source content", content)
 	}
 }
