@@ -70,3 +70,29 @@ tasks:
     protect:
       - ".X11-unix"
       - "systemd-private-*"
+
+  # Incremental, verified backups (v0.2.0). One run writes one complete snapshot
+  # and prunes the older ones; unchanged files are hardlinked from the previous
+  # snapshot, so a rerun costs no disk. Uncomment, set the paths, and remove the
+  # "#" that comments the fields out.
+  #
+  # - name: data
+  #   type: backup
+  #   # The trees to back up. One source root per backup task: one snapshot is one
+  #   # complete, restorable tree.
+  #   roots:
+  #     - /srv/app/data
+  #   # Where the snapshots live. This is an output path, never a source: it must
+  #   # sit outside the roots above, and cronkite only ever writes there and
+  #   # removes whole snapshots it wrote itself.
+  #   destination: /srv/backups/app
+  #   # Keep the newest snapshot of each UTC day for 7 days and of each ISO week
+  #   # for 4 weeks; delete the rest. 0 turns a rule off, and 0/0 is refused
+  #   # because it keeps nothing.
+  #   retention:
+  #     daily: 7
+  #     weekly: 4
+  #   # Share of the snapshot re-hashed against the source after it is written,
+  #   # so a run proves it can restore instead of assuming it. At least one file
+  #   # is always verified. Default: 10.
+  #   verify_sample_percent: 10

@@ -27,6 +27,20 @@ import (
 // current is the only supported configuration schema version.
 const current = 1
 
+// TypeBackup is the task type whose fields this package validates beyond the
+// ones every task shares. It is named here because a backup task's destination
+// and retention are configuration, so their defaults and their problems have to
+// be reported with the rest of the file instead of surfacing one run later.
+const TypeBackup = "backup"
+
+// Defaults for the fields only a backup task uses. They are exported so the
+// task that consumes them falls back on the same numbers this package validates.
+const (
+	DefaultRetentionDaily  = 7
+	DefaultRetentionWeekly = 4
+	DefaultSamplePercent   = 10
+)
+
 // Config is the parsed configuration file.
 type Config struct {
 	Version int    `yaml:"version"`
@@ -86,11 +100,32 @@ type Task struct {
 	RemoveEmptyDirs *bool    `yaml:"remove_empty_dirs"`
 	Protect         []string `yaml:"protect"`
 
+	// Destination is where a backup task publishes its snapshots. It is an
+	// output path and not a root: nothing is ever deleted inside it except a
+	// whole snapshot cronkite wrote itself, and it must sit outside the task's
+	// source, which is what roots describes.
+	Destination string `yaml:"destination"`
+	// Retention bounds the snapshot history a backup task keeps.
+	Retention Retention `yaml:"retention"`
+	// VerifySamplePercent is the share of a snapshot's files re-hashed against
+	// the source after it is written. Absent means DefaultSamplePercent, and at
+	// least one file is always verified.
+	VerifySamplePercent *int `yaml:"verify_sample_percent"`
+
 	// UnresolvedRoots holds roots whose path depends on an environment
 	// variable that is not set here. One configuration is meant to be shared
 	// between Linux and Windows, so "%TEMP%" on Linux is inapplicable rather
 	// than invalid.
 	UnresolvedRoots []string `yaml:"-"`
+}
+
+// Retention is how much snapshot history a backup task keeps: the newest
+// snapshot of each UTC day for Daily days and of each ISO week for Weekly weeks.
+// A zero value turns that rule off by naming the other one; both zero is
+// refused, because a policy that keeps nothing deletes everything.
+type Retention struct {
+	Daily  *int `yaml:"daily"`
+	Weekly *int `yaml:"weekly"`
 }
 
 // IsEnabled reports whether the task should run. Absent means enabled.
@@ -246,6 +281,45 @@ func (c *Config) normalize() error {
 			add("%s: roots is required", where)
 		}
 
+		// A backup's destination is an output path: it is expanded and required
+		// here for the same reason a root is, and it is deliberately not folded
+		// into roots, which describe what may be deleted inside.
+		if t.Type == TypeBackup {
+			switch dest := expand(t.Destination); {
+			case t.Destination == "":
+				add("%s: destination is required for a backup task", where)
+			case dest == "":
+				add("%s: destination %q depends on an environment variable that is not set here", where, t.Destination)
+			case !filepath.IsAbs(dest):
+				add("%s: destination %q must be absolute", where, dest)
+			default:
+				t.Destination = dest
+			}
+			if t.Retention.Daily == nil {
+				t.Retention.Daily = intPtr(DefaultRetentionDaily)
+			}
+			if t.Retention.Weekly == nil {
+				t.Retention.Weekly = intPtr(DefaultRetentionWeekly)
+			}
+			if t.VerifySamplePercent == nil {
+				t.VerifySamplePercent = intPtr(DefaultSamplePercent)
+			}
+		}
+		if t.Retention.Daily != nil && *t.Retention.Daily < 0 {
+			add("%s: retention.daily must not be negative (0 turns the daily rule off)", where)
+		}
+		if t.Retention.Weekly != nil && *t.Retention.Weekly < 0 {
+			add("%s: retention.weekly must not be negative (0 turns the weekly rule off)", where)
+		}
+		if t.Retention.Daily != nil && t.Retention.Weekly != nil && *t.Retention.Daily == 0 && *t.Retention.Weekly == 0 {
+			add("%s: retention keeps no snapshot: retention.daily and retention.weekly are both 0", where)
+		}
+		if t.VerifySamplePercent != nil {
+			if p := *t.VerifySamplePercent; p < 0 || p > 100 {
+				add("%s: verify_sample_percent must be between 0 and 100, got %d", where, p)
+			}
+		}
+
 		if t.OlderThan != "" {
 			d, err := durationx.Parse(t.OlderThan)
 			if err != nil {
@@ -363,6 +437,8 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+func intPtr(v int) *int { return &v }
 
 func validName(name string) bool {
 	for _, r := range name {

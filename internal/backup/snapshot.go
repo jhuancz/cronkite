@@ -59,6 +59,23 @@ type Skip struct {
 	Reason string `json:"reason"`
 }
 
+// Written is one file the snapshot holds, with the way the writer produced it.
+//
+// The counts in Result say how much work a snapshot took; this says what the
+// work was, per path, so a caller can report a backup as the snapshot it
+// published instead of inferring an entry list from numbers it cannot attribute.
+// A relink is not a copy: the kinds are kept apart here because the operator
+// pays for the difference in disk and in time.
+type Written struct {
+	// Path is relative to the snapshot root and slash-separated.
+	Path string `json:"path"`
+	// Size is the size of the file in bytes.
+	Size int64 `json:"size"`
+	// Shared reports whether the bytes came from the previous snapshot through
+	// a hardlink instead of being written again.
+	Shared bool `json:"shared,omitempty"`
+}
+
 // Fallback is one file that could not be hardlinked from the previous snapshot
 // and had to be copied again.
 //
@@ -92,6 +109,9 @@ type Result struct {
 	// BytesRelinked is the number of bytes the previous snapshot supplied, which
 	// is what incremented backups save.
 	BytesRelinked int64 `json:"bytes_deduplicated"`
+	// Files are the entries the snapshot holds, in the order the source was
+	// walked, each marked as written or shared with the previous snapshot.
+	Files []Written `json:"files,omitempty"`
 	// Fallbacks are the files that had to be copied after a failed hardlink.
 	Fallbacks []Fallback `json:"relink_fallbacks,omitempty"`
 	// Skipped are the source entries left out, with the reason.
@@ -325,6 +345,7 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 						res.RelinkedUnverified++
 					}
 					res.BytesRelinked += shared.Size
+					res.Files = append(res.Files, Written{Path: relSlash, Size: shared.Size, Shared: true})
 					return manifest.Add(shared)
 				}
 				// A hardlink needs both snapshots on one filesystem, and a Windows
@@ -342,6 +363,7 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		entry.SHA256 = digest
 		res.Copied++
 		res.BytesCopied += size
+		res.Files = append(res.Files, Written{Path: relSlash, Size: size})
 		return manifest.Add(entry)
 	}, func(abs string, err error) {
 		res.Skipped = append(res.Skipped, Skip{Path: w.relSlash(abs), Reason: ReasonUnreadable})
