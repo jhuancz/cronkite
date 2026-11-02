@@ -14,7 +14,7 @@ import (
 func Human(w io.Writer, r *Report) error {
 	verb := "removed"
 	if r.Mode == ModePlan {
-		verb = "would remove"
+		verb = plannedVerb(r)
 	}
 
 	fmt.Fprintf(w, "cronkite %s  run %s  %s  status=%s\n", r.Tool.Version, r.RunID, r.Mode, r.Status)
@@ -27,9 +27,10 @@ func Human(w io.Writer, r *Report) error {
 		written := zeroDash(task.Totals.FilesWritten + task.Totals.FilesRelinked)
 		size := task.Totals.BytesFreed + task.Totals.BytesWritten + task.Totals.BytesRelinked
 		if r.Mode == ModePlan {
-			// A rehearsal has not written anything yet, so the written column
-			// stays empty instead of repeating the plan.
-			count = fmt.Sprintf("%d", task.Planned)
+			// Only a per-file plan can show per-file counts. A backup plans
+			// aggregate work, so its row reports the size and says the rest in its
+			// notes instead of pretending an action count is a file count.
+			count = zeroDash(countKind(task.Actions, ActionDelete, ActionRmdir))
 			written = "-"
 			size = task.PlannedBytes
 		}
@@ -47,7 +48,17 @@ func Human(w io.Writer, r *Report) error {
 	// earlier snapshot says how much of its work was a link rather than a copy.
 	parts := make([]string, 0, 3)
 	if r.Mode == ModePlan {
-		parts = append(parts, fmt.Sprintf("%s files, %s %s", zeroDash(r.Planned()), bytesx.Format(r.affectedBytes()), verb))
+		removals := countKind(allActions(r), ActionDelete, ActionRmdir)
+		writes := countKind(allActions(r), ActionWrite, ActionRelink)
+		if removals > 0 {
+			parts = append(parts, fmt.Sprintf("%s files, %s %s", zeroDash(removals), bytesx.Format(bytesKind(allActions(r), ActionDelete, ActionRmdir)), verb))
+		}
+		if writes > 0 {
+			parts = append(parts, fmt.Sprintf("%s %s", bytesx.Format(bytesKind(allActions(r), ActionWrite, ActionRelink)), verb))
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "nothing to do")
+		}
 	} else {
 		if r.Totals.FilesRemoved > 0 {
 			parts = append(parts, fmt.Sprintf("%d files, %s removed", r.Totals.FilesRemoved, bytesx.Format(r.Totals.BytesFreed)))
@@ -73,6 +84,13 @@ func Human(w io.Writer, r *Report) error {
 	if skipped := skippedReasons(r); len(skipped) > 0 {
 		fmt.Fprintf(w, "\n  skipped:\n%s", indent(skipped))
 	}
+	for _, task := range r.Tasks {
+		if len(task.Notes) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "\n  %s:\n", task.Name)
+		fmt.Fprint(w, indent(task.Notes))
+	}
 	if len(r.Notes) > 0 {
 		fmt.Fprintf(w, "\n  notes:\n%s", indent(r.Notes))
 	}
@@ -81,6 +99,60 @@ func Human(w io.Writer, r *Report) error {
 		fmt.Fprintf(w, "\n  nothing was changed. re-run with --apply to execute.\n")
 	}
 	return nil
+}
+
+// plannedVerb names what a rehearsal would actually do, so a backup plan is not
+// described as a deletion.
+func plannedVerb(r *Report) string {
+	removals := countKind(allActions(r), ActionDelete, ActionRmdir)
+	writes := countKind(allActions(r), ActionWrite, ActionRelink)
+	switch {
+	case writes > 0 && removals > 0:
+		return "would copy or remove"
+	case writes > 0:
+		return "would write"
+	case removals > 0:
+		return "would remove"
+	default:
+		// Nothing was planned, usually because planning failed; naming a verb
+		// here would describe work that does not exist.
+		return "would do"
+	}
+}
+
+// allActions flattens the planned or performed actions of every task.
+func allActions(r *Report) []Action {
+	var out []Action
+	for _, t := range r.Tasks {
+		out = append(out, t.Actions...)
+	}
+	return out
+}
+
+func countKind(actions []Action, kinds ...ActionKind) int {
+	n := 0
+	for _, a := range actions {
+		for _, k := range kinds {
+			if a.Action == k {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+func bytesKind(actions []Action, kinds ...ActionKind) int64 {
+	var total int64
+	for _, a := range actions {
+		for _, k := range kinds {
+			if a.Action == k {
+				total += a.Size
+				break
+			}
+		}
+	}
+	return total
 }
 
 // Planned is the number of actions the run intended, across every task.

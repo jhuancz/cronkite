@@ -65,11 +65,27 @@ func (p *Plan) Files() int {
 	return n
 }
 
-// Bytes is the total size planned for deletion.
+// Bytes is the total size of every planned action, whatever it does. It answers
+// "how much work is this", not "how much data will this free".
 func (p *Plan) Bytes() int64 {
 	var total int64
 	for _, a := range p.Actions {
 		total += a.Size
+	}
+	return total
+}
+
+// DeleteBytes is the size planned for deletion. The safety ceilings are about
+// destruction, so they must count this and never the whole plan: a backup that
+// copies six gigabytes destroys nothing, and refusing it with a message about
+// removing six gigabytes would be both wrong and alarming.
+func (p *Plan) DeleteBytes() int64 {
+	var total int64
+	for _, a := range p.Actions {
+		switch a.Kind {
+		case report.ActionDelete, report.ActionRmdir:
+			total += a.Size
+		}
 	}
 	return total
 }

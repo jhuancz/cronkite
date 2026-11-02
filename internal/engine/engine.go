@@ -179,7 +179,7 @@ func checkSafety(cfg *config.Config, jobs []*job, force bool) string {
 			continue
 		}
 		files += j.plan.Files()
-		bytes += j.plan.Bytes()
+		bytes += j.plan.DeleteBytes()
 	}
 	if files == 0 && bytes == 0 {
 		return ""
