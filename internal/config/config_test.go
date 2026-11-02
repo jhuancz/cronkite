@@ -401,3 +401,130 @@ func TestCleanupTaskStillNeedsNoDestination(t *testing.T) {
 		t.Fatalf("a logclean task gained backup fields: %+v", cfg.Tasks[0])
 	}
 }
+
+// scriptYAML builds a one-task script configuration around the given extra
+// lines, so a validation case reads as the field it is about.
+func scriptYAML(extra string) []byte {
+	return []byte("version: 1\ntasks:\n  - name: maint\n    type: script\n" + extra)
+}
+
+// A script task is a file and an interpreter: it has no roots of its own,
+// because it decides for itself what it touches, and a timeout it does not name
+// gets the documented default.
+func TestScriptTaskDefaults(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "maintenance.sh")
+	cfg, err := Parse(scriptYAML("    interpreter: bash\n    file: " + script + "\n    args: [--rotate, \"--quiet now\"]\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	task := cfg.Tasks[0]
+	if task.Interpreter != "bash" {
+		t.Errorf("interpreter = %q, want %q", task.Interpreter, "bash")
+	}
+	if task.File != script {
+		t.Errorf("file = %q, want %q", task.File, script)
+	}
+	if task.Timeout != DefaultScriptTimeout {
+		t.Errorf("timeout = %q, want %q", task.Timeout, DefaultScriptTimeout)
+	}
+	if len(task.Args) != 2 || task.Args[0] != "--rotate" || task.Args[1] != "--quiet now" {
+		t.Errorf("args = %v, want them kept as written", task.Args)
+	}
+	if len(task.Roots) != 0 {
+		t.Errorf("roots = %v, want none required for a script task", task.Roots)
+	}
+}
+
+// The interpreter list is closed and the file is an operator-supplied path, so
+// both are judged here, before a run - not at three in the morning.
+func TestScriptTaskIsValidated(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "maintenance.sh")
+	cases := []struct {
+		name  string
+		extra string
+		want  string
+	}{
+		{
+			name:  "interpreter missing",
+			extra: "    file: " + script + "\n",
+			want:  "interpreter is required for a script task",
+		},
+		{
+			name:  "interpreter unknown",
+			extra: "    interpreter: zsh\n    file: " + script + "\n",
+			want:  `interpreter "zsh" is not supported`,
+		},
+		{
+			name:  "file missing",
+			extra: "    interpreter: bash\n",
+			want:  "file is required for a script task",
+		},
+		{
+			name:  "file relative",
+			extra: "    interpreter: bash\n    file: scripts/maintenance.sh\n",
+			want:  "must be absolute",
+		},
+		{
+			name:  "file from an unset variable",
+			extra: "    interpreter: bash\n    file: \"%CRONKITE_TEST_UNSET_SCRIPT%\"\n",
+			want:  "depends on an environment variable that is not set here",
+		},
+		{
+			name:  "timeout unparsable",
+			extra: "    interpreter: bash\n    file: " + script + "\n    timeout: soon\n",
+			want:  "timeout",
+		},
+		{
+			name:  "timeout without a unit",
+			extra: "    interpreter: bash\n    file: " + script + "\n    timeout: \"5\"\n",
+			want:  "timeout",
+		},
+		{
+			name:  "timeout zero",
+			extra: "    interpreter: bash\n    file: " + script + "\n    timeout: \"0s\"\n",
+			want:  "timeout must be positive",
+		},
+		{
+			name:  "timeout negative",
+			extra: "    interpreter: bash\n    file: " + script + "\n    timeout: \"-1m\"\n",
+			want:  "timeout must be positive",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(scriptYAML(tc.extra))
+			if err == nil {
+				t.Fatalf("expected %q, got no error", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error should mention %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// A timeout the operator chose is kept as written, in the units an operator
+// writes, so the default is a fallback and not an override.
+func TestScriptTaskKeepsItsTimeout(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "maintenance.sh")
+	cfg, err := Parse(scriptYAML("    interpreter: sh\n    file: " + script + "\n    timeout: \"90s\"\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Tasks[0].Timeout != "90s" {
+		t.Fatalf("timeout = %q, want it kept as written", cfg.Tasks[0].Timeout)
+	}
+}
+
+// The script fields belong to the script type: a log cleaner gains no
+// interpreter, no file and no timeout it never had.
+func TestCleanupTaskGainsNoScriptFields(t *testing.T) {
+	cfg, err := Parse([]byte("version: 1\ntasks:\n  - name: logs\n    type: logclean\n    roots: [" + t.TempDir() + "]\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if task := cfg.Tasks[0]; task.Interpreter != "" || task.File != "" || task.Timeout != "" {
+		t.Fatalf("a logclean task gained script fields: %+v", task)
+	}
+}

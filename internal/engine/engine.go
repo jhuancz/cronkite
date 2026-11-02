@@ -115,7 +115,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (*report.Report,
 		defer func() { _ = handle.Release() }()
 	}
 
-	env := task.Env{Mode: mode, Now: now}
+	env := task.Env{Mode: mode, Now: now, RunID: rep.RunID}
 	jobs := make([]*job, 0, len(runners))
 	var interrupted error
 
@@ -338,6 +338,7 @@ func taskReport(j *job, mode report.Mode, maxActions int) report.Task {
 				rt.Totals = rt.Totals.WithAction(done.Kind, done.Size)
 			}
 			rt.Totals.DirsRemoved = j.result.DirsRemoved
+			rt.Notes = append(rt.Notes, j.result.Notes...)
 			rt.Totals.Skipped += len(j.result.Skipped)
 			for _, f := range j.result.Failed {
 				rt.Errors = append(rt.Errors, report.Failure{Path: f.Path, Error: f.Err.Error()})

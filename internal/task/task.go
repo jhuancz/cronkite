@@ -32,6 +32,11 @@ type Env struct {
 	// Now is the reference time for age comparisons. Injected so tests are
 	// deterministic and a long run does not use a moving cutoff.
 	Now time.Time
+	// RunID is the identifier of the report this run will write. A task that runs
+	// someone else's code hands it to that code, so a script's own log can be
+	// correlated with the report that describes it. It is empty only when a task
+	// is driven directly by a test.
+	RunID string
 }
 
 // Runner is one maintenance task.
@@ -107,6 +112,10 @@ type Result struct {
 	Failed      []Failure
 	Skipped     []Action
 	DirsRemoved int
+	// Notes is a task's own operator-facing output: what a script printed, what a
+	// summary line said. It is merged into the report next to the plan's notes, so
+	// a task that produced no actions can still explain itself.
+	Notes []string
 }
 
 // Failure is one path that could not be handled.

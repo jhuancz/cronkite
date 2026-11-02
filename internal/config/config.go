@@ -33,6 +33,28 @@ const current = 1
 // be reported with the rest of the file instead of surfacing one run later.
 const TypeBackup = "backup"
 
+// TypeScript is the task type that runs an operator-supplied script file. It is
+// named here for the same reason as TypeBackup: its interpreter, its file and
+// its timeout are configuration, and a wrong one has to be a problem at load
+// time and not a surprise in a scheduled run.
+const TypeScript = "script"
+
+// ScriptInterpreters lists the interpreters a script task may name. The list is
+// closed on purpose: cronkite knows how it starts these three and how it stops
+// them, and an interpreter nobody tested is a configuration mistake rather than
+// a runtime experiment.
+var ScriptInterpreters = []string{"bash", "sh", "powershell"}
+
+// IsScriptInterpreter reports whether name is one of ScriptInterpreters.
+func IsScriptInterpreter(name string) bool {
+	for _, known := range ScriptInterpreters {
+		if name == known {
+			return true
+		}
+	}
+	return false
+}
+
 // Defaults for the fields only a backup task uses. They are exported so the
 // task that consumes them falls back on the same numbers this package validates.
 const (
@@ -44,6 +66,11 @@ const (
 	// run.safety: a first snapshot of a 200 GiB tree is a decision an operator
 	// has to make, not one a default should make for them.
 	DefaultMaxBackupBytes = "5GiB"
+
+	// DefaultScriptTimeout bounds one script run when the task does not say. A
+	// script that hangs is a script that holds the run lock, so the cap is part
+	// of the contract and not optional.
+	DefaultScriptTimeout = "5m"
 )
 
 // Config is the parsed configuration file.
@@ -122,6 +149,19 @@ type Task struct {
 	// this task exists to take. A run whose plan would copy more is refused
 	// before anything is written. Absent means DefaultMaxBackupBytes.
 	MaxBackupBytes string `yaml:"max_backup_bytes"`
+
+	// Interpreter is the program a script task runs its file with: one of
+	// ScriptInterpreters. File is the script itself, which is a file the
+	// operator names - cronkite never downloads or generates it - so its path is
+	// required and absolute, like a root or a backup destination.
+	Interpreter string `yaml:"interpreter"`
+	File        string `yaml:"file"`
+	// Timeout bounds one script run. Absent means DefaultScriptTimeout. A run
+	// past it is killed as a process group, so nothing the script started
+	// outlives the run.
+	Timeout string `yaml:"timeout"`
+	// Args are handed to the script after the file, in order and unquoted.
+	Args []string `yaml:"args"`
 
 	// UnresolvedRoots holds roots whose path depends on an environment
 	// variable that is not set here. One configuration is meant to be shared
@@ -288,7 +328,9 @@ func (c *Config) normalize() error {
 			expanded = append(expanded, resolved)
 		}
 		t.Roots = expanded
-		if len(t.Roots) == 0 && len(t.UnresolvedRoots) == 0 {
+		// A script names its own file and decides for itself what it touches, so
+		// requiring roots would ask for a scope cronkite does not enforce on it.
+		if len(t.Roots) == 0 && len(t.UnresolvedRoots) == 0 && t.Type != TypeScript {
 			add("%s: roots is required", where)
 		}
 
@@ -322,6 +364,38 @@ func (c *Config) normalize() error {
 				add("%s: %v", where, err)
 			}
 		}
+		// A script's file is read by an interpreter, so the path is checked the
+		// way a root is: absolute, environment-expandable, and never a guess made
+		// at run time. Whether it exists is a run-time question the task answers
+		// before starting anything.
+		if t.Type == TypeScript {
+			interpreters := strings.Join(ScriptInterpreters, ", ")
+			switch {
+			case t.Interpreter == "":
+				add("%s: interpreter is required for a script task (want one of: %s)", where, interpreters)
+			case !IsScriptInterpreter(t.Interpreter):
+				add("%s: interpreter %q is not supported (want one of: %s)", where, t.Interpreter, interpreters)
+			}
+
+			switch file := expand(t.File); {
+			case t.File == "":
+				add("%s: file is required for a script task", where)
+			case file == "":
+				add("%s: file %q depends on an environment variable that is not set here", where, t.File)
+			case !filepath.IsAbs(file):
+				add("%s: file %q must be absolute", where, file)
+			default:
+				t.File = file
+			}
+
+			t.Timeout = firstNonEmpty(t.Timeout, DefaultScriptTimeout)
+			if d, err := durationx.Parse(t.Timeout); err != nil {
+				add("%s: timeout: %v", where, err)
+			} else if d <= 0 {
+				add("%s: timeout must be positive (a run that expires at once cannot do anything)", where)
+			}
+		}
+
 		if t.Retention.Daily != nil && *t.Retention.Daily < 0 {
 			add("%s: retention.daily must not be negative (0 turns the daily rule off)", where)
 		}

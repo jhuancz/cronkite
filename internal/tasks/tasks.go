@@ -13,16 +13,19 @@ import (
 	"github.com/jhuancz/cronkite/internal/task"
 	"github.com/jhuancz/cronkite/internal/tasks/backup"
 	"github.com/jhuancz/cronkite/internal/tasks/cleanup"
+	"github.com/jhuancz/cronkite/internal/tasks/script"
 )
 
 // Types lists the task types this build supports.
-var Types = []string{config.TypeBackup, "logclean", "tempclean"}
+var Types = []string{config.TypeBackup, config.TypeScript, "logclean", "tempclean"}
 
 // Build constructs one task from its configuration.
 func Build(cfg config.Task) (task.Runner, error) {
 	switch cfg.Type {
 	case config.TypeBackup:
 		return backup.New(cfg)
+	case config.TypeScript:
+		return script.New(cfg)
 	case "logclean", "tempclean":
 		return cleanup.New(cfg)
 	default:
