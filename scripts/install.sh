@@ -100,10 +100,15 @@ if [ -z "$binary" ] || [ ! -x "$binary" ]; then
 	exit 1
 fi
 
+wrapper_path='not installed (--no-wrapper)'
+if [ "$with_wrapper" = "1" ]; then
+	wrapper_path="${bindir}/cronkite-run.sh"
+fi
+
 say "binary:  ${binary}"
 say "install: ${bindir}/cronkite"
 say "config:  ${configdir}/cronkite.conf"
-say "wrapper: $( [ "$with_wrapper" = "1" ] && echo "${bindir}/cronkite-run.sh" || echo 'not installed (--no-wrapper)' )"
+say "wrapper: ${wrapper_path}"
 
 # 2. Install the binary and the wrapper.
 run install -d "$bindir"
@@ -141,7 +146,11 @@ Installed. Next:
   3. Rehearse:   ${bindir}/cronkite plan -config ${configdir}/cronkite.conf
   4. Schedule it, using the wrapper so a locked run stays silent:
 
-       30 3 * * * ${bindir}/cronkite-run.sh >> /var/log/cronkite.log 2>&1
+       30 3 * * * ${wrapper_path} >> /var/log/cronkite.log 2>&1
+
+     The wrapper resolves the binary next to itself, so this line works for the
+     prefix you chose. Point CRONKITE_CONFIG at ${configdir}/cronkite.conf if you
+     installed the configuration somewhere cronkite does not search.
 
      or, with systemd:
 

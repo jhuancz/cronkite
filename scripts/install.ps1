@@ -71,6 +71,11 @@ if ($Register) {
     $action = "powershell.exe -NoProfile -File `"$Prefix\cronkite-run.ps1`""
     Invoke-Step "register the scheduled task $TaskName (daily at 03:30)" {
         schtasks.exe /create /tn $TaskName /tr $action /sc daily /st 03:30 /f | Out-Null
+        # PowerShell does not turn a native non-zero exit into a terminating error,
+        # so without this the installer would report success with no task created.
+        if ($LASTEXITCODE -ne 0) {
+            throw "schtasks failed with exit code $LASTEXITCODE; the scheduled task was not created"
+        }
     }
 }
 

@@ -13,7 +13,11 @@
 
 set -uo pipefail
 
-cronkite_bin=${CRONKITE_BIN:-/usr/local/bin/cronkite}
+# The wrapper ships next to the binary it runs, so an install under any prefix
+# works without the operator having to export anything. CRONKITE_BIN still wins
+# when set, for the case where the two are deliberately separated.
+wrapper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cronkite_bin=${CRONKITE_BIN:-${wrapper_dir}/cronkite}
 
 # Built as one non-empty array. macOS still ships bash 3.2, where expanding an
 # empty array under `set -u` is an unbound-variable error: a wrapper that dies

@@ -11,7 +11,9 @@
 
 [CmdletBinding()]
 param(
-    [string]$CronkiteBin = "$env:ProgramFiles\cronkite\cronkite.exe",
+    # The wrapper ships next to the binary it runs, so an install under any prefix
+    # works without the scheduler having to set anything.
+    [string]$CronkiteBin = (Join-Path $PSScriptRoot 'cronkite.exe'),
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Arguments = @()
 )
