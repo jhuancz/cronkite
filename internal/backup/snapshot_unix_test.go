@@ -42,3 +42,25 @@ func TestWriteSkipsNonRegularFiles(t *testing.T) {
 		t.Fatal("the FIFO must not be recorded in the manifest")
 	}
 }
+
+// A Unix file name may contain a backslash, which the manifest refuses because
+// on Windows it would restore as a path separator. Skipping that one name must
+// not abort the backup of everything else.
+func TestWriteSkipsBackslashName(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, `weird\name.txt`), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSourceFile(t, src, "ok.txt", "ok")
+
+	res, err := newWriter(t, []string{src}, filepath.Join(t.TempDir(), "d")).Write(context.Background(), firstRun)
+	if err != nil {
+		t.Fatalf("one unrepresentable name must not abort the snapshot: %v", err)
+	}
+	if !skippedFor(res, ReasonNotRepresentable) {
+		t.Fatalf("expected a %s skip, got %+v", ReasonNotRepresentable, res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(res.Snapshot, "ok.txt")); err != nil {
+		t.Errorf("the rest of the tree must still be backed up: %v", err)
+	}
+}

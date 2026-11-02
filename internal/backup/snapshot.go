@@ -9,7 +9,9 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -35,9 +37,13 @@ const (
 	ReasonSymlink = "symlink"
 	// ReasonNotRegular marks devices, sockets and FIFOs.
 	ReasonNotRegular = "not_a_regular_file"
-	// ReasonReservedName marks a source file named manifest.json at the root of
-	// the tree: that name is the snapshot's index.
+	// ReasonReservedName marks a source entry whose name is the snapshot's own
+	// index file.
 	ReasonReservedName = "reserved_name"
+	// ReasonNotRepresentable marks a source entry whose name cannot be written
+	// into a portable manifest: a Unix file name may contain a backslash, which
+	// the manifest refuses because on Windows it would restore as a separator.
+	ReasonNotRepresentable = "not_representable"
 	// ReasonUnreadable marks an entry whose metadata or directory could not be
 	// read. It is recorded, not fatal: one unreadable directory must not hide
 	// the rest of the tree from the backup.
@@ -75,6 +81,11 @@ type Result struct {
 	Copied int `json:"files_copied"`
 	// Relinked is the number of files shared with the previous snapshot.
 	Relinked int `json:"files_relinked"`
+	// RelinkedUnverified is the subset of Relinked that was shared on the
+	// strength of size and modification time alone, without re-reading the
+	// source. It is zero under the default policy, and it exists so a fast-path
+	// run can never be mistaken for a verified one.
+	RelinkedUnverified int `json:"files_relinked_unverified,omitempty"`
 	// BytesCopied is the number of bytes read from the source and written.
 	BytesCopied int64 `json:"bytes_copied"`
 	// BytesRelinked is the number of bytes the previous snapshot supplied, which
@@ -103,6 +114,8 @@ type Writer struct {
 	// link is os.Link in production, and a seam for the tests: the fallback path
 	// must be exercised without depending on a second filesystem being mounted.
 	link func(oldname, newname string) error
+	// mode decides when a file may be shared instead of written again.
+	mode RelinkMode
 }
 
 // NewWriter prepares to snapshot the roots owned by guard into dest.
@@ -123,7 +136,7 @@ func NewWriter(guard *fsx.Guard, dest string) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve destination %q: %w", dest, err)
 	}
-	if within(source.Dir(), resolve(abs)) {
+	if withinFS(source.Dir(), resolve(abs)) {
 		return nil, fmt.Errorf("backup: destination %q is inside source root %q", abs, source.Dir())
 	}
 
@@ -131,7 +144,21 @@ func NewWriter(guard *fsx.Guard, dest string) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open source root %q for reading: %w", source.Dir(), err)
 	}
-	return &Writer{dest: abs, source: source, read: read, link: os.Link}, nil
+	return &Writer{dest: abs, source: source, read: read, link: os.Link, mode: RelinkChecksum}, nil
+}
+
+// SetRelinkMode selects how strictly a file must be proven unchanged before it
+// is shared with the previous snapshot. The default, RelinkChecksum, re-reads
+// the source; RelinkSizeMtime trades that guarantee for speed and reports every
+// file it shares without re-reading as RelinkedUnverified.
+func (w *Writer) SetRelinkMode(mode RelinkMode) error {
+	switch mode {
+	case RelinkChecksum, RelinkSizeMtime:
+		w.mode = mode
+		return nil
+	default:
+		return fmt.Errorf("backup: unknown relink mode %q", mode)
+	}
 }
 
 // Close releases the source handle.
@@ -174,6 +201,8 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		return res, err
 	}
 
+	w.sweepStaleStages()
+
 	stage, err := os.MkdirTemp(w.dest, stagePrefix+name+"-")
 	if err != nil {
 		return res, fmt.Errorf("create working directory in %s: %w", w.dest, err)
@@ -190,11 +219,24 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+
+		relSlash := filepath.ToSlash(rel)
+		// The index of the snapshot lives at the root of the snapshot. A source
+		// entry with that name - file or directory, in any case, because macOS
+		// and Windows resolve names case-insensitively - would collide with it,
+		// so it is left out and reported instead of failing the whole snapshot.
+		if path.Dir(relSlash) == "." && strings.EqualFold(relSlash, ManifestName) {
+			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonReservedName})
+			if d.IsDir() {
+				// The whole subtree belongs to the collision, not just the entry.
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
 			return nil
 		}
 
-		relSlash := filepath.ToSlash(rel)
 		switch {
 		case d.Type()&fs.ModeSymlink != 0:
 			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonSymlink})
@@ -202,10 +244,10 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		case !d.Type().IsRegular():
 			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRegular})
 			return nil
-		case relSlash == ManifestName:
-			// The index of the snapshot lives at the root of the snapshot, so a
-			// source file with that name would be overwritten by it.
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonReservedName})
+		case strings.ContainsRune(relSlash, '\\'):
+			// Skipping one name the manifest cannot represent beats failing every
+			// backup, and the report says which file was left out.
+			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRepresentable})
 			return nil
 		}
 
@@ -224,12 +266,19 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		// Incrementality is decided from the manifest, not from the source: a
 		// file whose size and mtime match the previous record, and which is
 		// still there, is the same bytes with the same digest.
-		if shared, ok := prev.Lookup(relSlash); ok && shared.Size == entry.Size && shared.ModTime.Equal(entry.ModTime) {
+		if shared, ok := prev.Lookup(relSlash); ok && w.relinkable(relSlash, shared, entry) {
 			target := filepath.Join(prevDir, filepath.FromSlash(relSlash))
-			if _, err := os.Lstat(target); err == nil {
+			// The target must still be a regular file. A symlink or a directory
+			// sitting where the previous snapshot should hold a file means that
+			// snapshot was tampered with, and linking it would pull content from
+			// outside the configured root into a published snapshot.
+			if info, err := os.Lstat(target); err == nil && info.Mode().IsRegular() {
 				err := w.link(target, dst)
 				if err == nil {
 					res.Relinked++
+					if w.mode != RelinkChecksum {
+						res.RelinkedUnverified++
+					}
 					res.BytesRelinked += shared.Size
 					return manifest.Add(shared)
 				}
@@ -240,7 +289,7 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 			}
 		}
 
-		digest, size, err := w.copyFile(dst, relSlash, info.Mode().Perm())
+		digest, size, err := w.copyFile(dst, relSlash, info.Mode().Perm(), entry.ModTime)
 		if err != nil {
 			return fmt.Errorf("copy %s: %w", relSlash, err)
 		}
@@ -259,14 +308,50 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	if err := manifest.WriteFile(filepath.Join(stage, ManifestName)); err != nil {
 		return res, fmt.Errorf("write snapshot manifest: %w", err)
 	}
+	// Durability, not only atomicity: without these the rename could survive a
+	// power loss while the data behind it did not, leaving a directory that looks
+	// like a complete snapshot and is not.
+	if err := syncDir(stage); err != nil {
+		return res, fmt.Errorf("flush snapshot directory %s: %w", stage, err)
+	}
 	if err := os.Rename(stage, final); err != nil {
 		return res, fmt.Errorf("publish snapshot %s: %w", final, err)
+	}
+	if err := syncDir(w.dest); err != nil {
+		return res, fmt.Errorf("flush destination %s: %w", w.dest, err)
 	}
 	published = true
 
 	res.Snapshot = final
 	res.Digest = manifest.Digest
 	return res, nil
+}
+
+// stageMaxAge is how long an abandoned stage directory may survive. Only a
+// hard kill leaves one behind, and a live stage of a correctly locked run is
+// seconds old.
+const stageMaxAge = time.Hour
+
+// sweepStaleStages removes stage directories left by a killed run. It is
+// best-effort and age-gated, so a stage that is being written right now is never
+// taken away; the run lock is what makes that judgement safe in the first place.
+// Without the sweep a killed relink run keeps pinning previous-snapshot inodes
+// that no retention pass can free.
+func (w *Writer) sweepStaleStages() {
+	entries, err := os.ReadDir(w.dest)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), stagePrefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < stageMaxAge {
+			continue
+		}
+		os.RemoveAll(filepath.Join(w.dest, e.Name()))
+	}
 }
 
 // previous returns the newest snapshot in the destination and its manifest.
@@ -311,9 +396,13 @@ func (w *Writer) previous() (string, *Manifest, error) {
 	return "", nil, nil
 }
 
-// copyFile copies one source file into the snapshot and returns the digest and
-// the number of bytes written.
-func (w *Writer) copyFile(dst, relSlash string, perm fs.FileMode) (string, int64, error) {
+// copyFile copies one source file into the snapshot, gives it back the source
+// modification time and returns the digest and the number of bytes written.
+//
+// The timestamp matters as much as the bytes: a restored tree whose files all
+// look freshly written breaks anything that reasons about age, and the manifest
+// records the source mtime, so the copy has to agree with it.
+func (w *Writer) copyFile(dst, relSlash string, perm fs.FileMode, modTime time.Time) (string, int64, error) {
 	in, err := w.read.Open(filepath.FromSlash(relSlash))
 	if err != nil {
 		return "", 0, err
@@ -334,10 +423,92 @@ func (w *Writer) copyFile(dst, relSlash string, perm fs.FileMode) (string, int64
 		out.Close()
 		return "", n, err
 	}
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
+	if err := os.Chtimes(dst, modTime, modTime); err != nil {
+		out.Close()
+		return "", n, err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return "", n, err
+	}
 	if err := out.Close(); err != nil {
 		return "", n, err
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// RelinkMode decides when a source file may be shared with the previous
+// snapshot instead of being written again.
+type RelinkMode string
+
+const (
+	// RelinkChecksum is the default: the source is re-read and its digest
+	// compared with the previous snapshot before the file is shared. It costs a
+	// read of every unchanged file, and it cannot be fooled by content that
+	// changed while size and modification time stayed the same.
+	RelinkChecksum RelinkMode = "checksum"
+	// RelinkSizeMtime is the fast policy link-dest snapshots use: equal size and
+	// modification time are taken to mean equal bytes. Every file it shares is
+	// counted in RelinkedUnverified, so the choice is visible in the report and
+	// no run can claim a guarantee it did not check.
+	RelinkSizeMtime RelinkMode = "size_mtime"
+)
+
+// foldCase reports whether path comparisons on this platform must ignore case.
+const foldCase = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+
+// relinkable reports whether the previous snapshot may supply this file.
+func (w *Writer) relinkable(rel string, shared, entry Entry) bool {
+	if shared.Size != entry.Size || !shared.ModTime.Equal(entry.ModTime) {
+		return false
+	}
+	if w.mode != RelinkChecksum {
+		return true
+	}
+	digest, err := w.digestFile(rel)
+	return err == nil && digest == shared.SHA256
+}
+
+// digestFile hashes one source file through the confined handle.
+func (w *Writer) digestFile(rel string) (string, error) {
+	f, err := w.read.Open(filepath.FromSlash(rel))
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// syncDir flushes a directory's entries to stable storage.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// withinFS reports whether p sits inside root, comparing case-insensitively on
+// the platforms whose filesystems usually are. On such a volume "photos" and
+// "Photos" are one directory, and a byte-wise comparison would cheerfully put
+// snapshots inside the source.
+func withinFS(root, p string) bool {
+	if foldCase {
+		return within(strings.ToLower(root), strings.ToLower(p))
+	}
+	return within(root, p)
 }
 
 // relSlash maps an absolute path inside the source to a snapshot-relative,

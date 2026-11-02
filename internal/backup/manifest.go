@@ -12,9 +12,13 @@
 //     are read through an os.Root, so a symlink planted in the tree cannot make
 //     a backup copy /etc/passwd into a snapshot.
 //   - Nothing is published half-done. A snapshot is built in a temporary
-//     directory inside the destination and renamed into place only after its
-//     manifest is written. A crashed or failed run leaves nothing an operator
-//     could mistake for a backup.
+//     directory inside the destination, flushed to stable storage and renamed
+//     into place only after its manifest is written. A crashed or failed run
+//     leaves nothing an operator could mistake for a backup.
+//   - Sharing is proven, not assumed. By default a file is compared with the
+//     previous snapshot by content before it is hardlinked; the cheaper
+//     size+mtime policy exists, but every file it shares is reported as
+//     unverified, so no run can claim more than it checked.
 //
 // What lives in a snapshot is described by its manifest, which is the contract
 // this package publishes. See Manifest for the on-disk format.
@@ -32,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ManifestSchema is the manifest format version. Bump it when a field is
@@ -172,6 +177,10 @@ func (m *Manifest) WriteFile(path string) error {
 		tmp.Close()
 		return fmt.Errorf("write manifest %s: %w", path, err)
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("flush manifest %s: %w", path, err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("write manifest %s: %w", path, err)
 	}
@@ -203,6 +212,14 @@ func ReadFile(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest %s: %w", path, err)
 	}
 	m.Files = files
+	// A manifest carries its own aggregate digest, so it can be checked instead
+	// of trusted. A digest that does not match its records means the file was
+	// truncated, edited, or written by something that was not this build.
+	if m.Digest != "" {
+		if want := m.ComputeDigest(); m.Digest != want {
+			return nil, fmt.Errorf("manifest %s: digest %s does not match its records (%s): the file is corrupt or was edited", path, m.Digest, want)
+		}
+	}
 	return &m, nil
 }
 
@@ -223,6 +240,9 @@ func (m *Manifest) canonical() ([]Entry, error) {
 		if i > 0 && files[i-1].Path == e.Path {
 			return nil, fmt.Errorf("manifest: duplicate entry %q", e.Path)
 		}
+		// One spelling of a digest: the aggregate digest lowercases internally,
+		// so an upper-case record would make two equal trees compare unequal.
+		files[i].SHA256 = strings.ToLower(e.SHA256)
 	}
 	return files, nil
 }
@@ -235,6 +255,13 @@ func validateEntry(e Entry) error {
 		return errors.New("manifest entry: empty path")
 	case containsBackslash(e.Path):
 		return fmt.Errorf("manifest entry %q: paths are slash-separated on every platform", e.Path)
+	case !utf8.ValidString(e.Path):
+		// JSON cannot carry invalid UTF-8: decoding would coerce the bytes to
+		// the replacement character and two distinct names would collapse into
+		// one, producing a manifest this build can no longer read.
+		return fmt.Errorf("manifest entry %q: path is not valid UTF-8", e.Path)
+	case e.Path == ":":
+		return fmt.Errorf("manifest entry %q: a bare %q is not a usable path", e.Path, ":")
 	case path.IsAbs(e.Path), filepath.IsAbs(e.Path):
 		return fmt.Errorf("manifest entry %q: paths are relative to the snapshot root", e.Path)
 	case e.Path == "." || e.Path == ".." || strings.HasPrefix(e.Path, "../") || path.Clean(e.Path) != e.Path:

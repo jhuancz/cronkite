@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -396,6 +397,11 @@ func TestWriteSkipsReservedManifestName(t *testing.T) {
 }
 
 func TestWriteLeavesNoSnapshotWhenCopyFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Withholding read permission is a Unix idea; on Windows chmod does not
+		// make a file unreadable, so this scenario cannot be built there.
+		t.Skip("permission-based failure injection is Unix-only")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("permission bits do not stop root from reading the file")
 	}
