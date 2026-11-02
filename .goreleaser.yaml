@@ -81,5 +81,9 @@ release:
     **Verify before you run it.** Every archive is listed in `checksums.txt`:
 
     ```sh
-    sha256sum -c checksums.txt --ignore-missing
+    grep <archive> checksums.txt | sha256sum -c -          # Linux
+    grep <archive> checksums.txt | shasum -a 256 -c -      # macOS
     ```
+
+    Windows: compare `(Get-FileHash <archive> -Algorithm SHA256).Hash` with the
+    line in `checksums.txt`.

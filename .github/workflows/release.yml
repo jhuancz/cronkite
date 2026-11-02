@@ -13,22 +13,38 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a commit, not a mutable major tag:
+      # this job holds a write token, so a moved tag must not be able to run
+      # different code. Update the SHA and the comment together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # The changelog is generated from git history, so the whole history
           # and the tag have to be present.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      # A tag is only trustworthy on a commit that already passed CI. Tagging a
+      # side branch or a local experiment must fail here, not publish binaries.
+      - name: require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not reachable from main; refusing to publish"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
 
+      # Same flags as CI: a release must not be built on a weaker signal than
+      # the one that gated the merge.
       - name: run the test suite before publishing anything
-        run: go test ./...
+        run: go test -race ./...
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           distribution: goreleaser
           version: "~> v2"

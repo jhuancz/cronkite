@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Checksum verification instructions now work on macOS, where `sha256sum` does
+  not exist (`shasum -a 256`). The broken command also shipped in the release
+  notes published by GoReleaser.
+- The release workflow refuses a tag that is not reachable from `main`, so a tag
+  on a side branch or a local experiment cannot publish binaries.
+- Third-party actions are pinned to commit SHAs: the release job holds a write
+  token and must not execute whatever a moved major tag happens to point at.
+- The release job runs the test suite with `-race`, matching CI, so a release is
+  never built on a weaker signal than the one that gated the merge.
 
 ## [0.1.0] - 2026-11-02
 

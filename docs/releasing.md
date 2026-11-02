@@ -8,7 +8,9 @@ makes the promise true.
 1. **Scope is complete.** The tag goes on a finished slice, not on work in
    progress. `CHANGELOG.md` describes exactly what ships.
 2. **CI is green on the commit that will be tagged.** Not on an earlier commit,
-   not on a branch. The exact SHA:
+   not on a branch. The release workflow enforces the "on main" half of this
+   rule by refusing a tag that is not reachable from `main`; the green half is
+   still your job. The exact SHA:
    ```sh
    git log --oneline -1
    # then check that this commit's CI run passed on Linux, macOS and Windows
@@ -59,11 +61,25 @@ which is how a development binary is told apart from a release one.
 Never run a maintenance binary you have not verified, especially one that
 deletes files:
 
+Download the archive and `checksums.txt` from the release, then verify. The
+command differs by platform, and `sha256sum` does not exist on macOS:
+
 ```sh
-curl -LO https://github.com/jhuancz/cronkite/releases/download/v0.1.0/checksums.txt
-curl -LO https://github.com/jhuancz/cronkite/releases/download/v0.1.0/cronkite_0.1.0_linux_amd64.tar.gz
-sha256sum -c checksums.txt --ignore-missing
+# Linux
+grep cronkite_0.1.0_linux_amd64.tar.gz checksums.txt | sha256sum -c -
+
+# macOS
+grep cronkite_0.1.0_darwin_arm64.tar.gz checksums.txt | shasum -a 256 -c -
+
+# Windows (PowerShell)
+$line = (Select-String -Path checksums.txt -Pattern 'cronkite_0.1.0_windows_amd64.zip').Line
+$expected = $line.Split()[0].ToUpper()
+$actual = (Get-FileHash cronkite_0.1.0_windows_amd64.zip -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw "checksum mismatch: $actual" }
 ```
+
+Both variants read the expected digest from `checksums.txt` instead of retyping
+it, so a signature line can never drift from the file that was downloaded.
 
 ## Installing without a release
 
