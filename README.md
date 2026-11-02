@@ -144,9 +144,13 @@ Sizes accept binary and decimal suffixes: `max_delete_bytes: 5GiB`.
 | --- | --- | --- | --- |
 | `logclean` | 30d | 4 | Rotated logs and application output |
 | `tempclean` | 7d | 8 | `/tmp`, `/var/tmp`, `%TEMP%` |
+| `backup` | 7 daily + 4 weekly snapshots | — | Incremental, verified hardlink snapshots of one tree |
 
-Both share one implementation with two presets: the risk profile of deleting a
-log differs from deleting a temp file, the mechanics must not.
+The two cleanup types share one implementation with two presets: the risk
+profile of deleting a log differs from deleting a temp file, the mechanics must
+not. A `backup` task has its own mechanics and its own ceiling
+(`max_backup_bytes`); what it does and does not do is described in
+[docs/architecture.md](docs/architecture.md).
 
 ## The report
 

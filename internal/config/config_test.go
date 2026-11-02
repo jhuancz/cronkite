@@ -244,6 +244,70 @@ func TestBackupTaskDefaults(t *testing.T) {
 	if task.VerifySamplePercent == nil || *task.VerifySamplePercent != DefaultSamplePercent {
 		t.Errorf("verify_sample_percent = %v, want %d", task.VerifySamplePercent, DefaultSamplePercent)
 	}
+	if task.MaxBackupBytes != DefaultMaxBackupBytes {
+		t.Errorf("max_backup_bytes = %q, want %q", task.MaxBackupBytes, DefaultMaxBackupBytes)
+	}
+	limit, err := task.BackupBytes()
+	if err != nil {
+		t.Fatalf("BackupBytes: %v", err)
+	}
+	if want := int64(5 << 30); limit != want {
+		t.Errorf("max_backup_bytes parses to %d, want %d", limit, want)
+	}
+}
+
+// The backup ceiling is a size like the run ceilings, and a value that cannot be
+// parsed or that refuses everything is a configuration mistake, not a silent
+// default.
+func TestMaxBackupBytesIsValidated(t *testing.T) {
+	cases := []struct {
+		name  string
+		extra string
+		want  string
+	}{
+		{
+			name:  "not a size",
+			extra: "    max_backup_bytes: lots\n",
+			want:  "max_backup_bytes",
+		},
+		{
+			name:  "zero",
+			extra: "    max_backup_bytes: \"0\"\n",
+			want:  "a ceiling of zero refuses every snapshot",
+		},
+		{
+			name:  "negative",
+			extra: "    max_backup_bytes: \"-1GiB\"\n",
+			want:  "max_backup_bytes",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(backupYAML(t.TempDir(), "    destination: "+t.TempDir()+"\n"+tc.extra))
+			if err == nil {
+				t.Fatalf("expected %q, got no error", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error should mention %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// A ceiling the operator chose is kept as written and parses to the bytes the
+// backup task enforces.
+func TestMaxBackupBytesIsKept(t *testing.T) {
+	cfg, err := Parse(backupYAML(t.TempDir(), "    destination: "+t.TempDir()+"\n    max_backup_bytes: \"250MiB\"\n"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	limit, err := cfg.Tasks[0].BackupBytes()
+	if err != nil {
+		t.Fatalf("BackupBytes: %v", err)
+	}
+	if want := int64(250 << 20); limit != want {
+		t.Fatalf("max_backup_bytes = %d bytes, want %d", limit, want)
+	}
 }
 
 // The destination is an output path, and a backup task that does not say where
@@ -333,7 +397,7 @@ func TestCleanupTaskStillNeedsNoDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Tasks[0].Destination != "" || cfg.Tasks[0].Retention.Daily != nil {
+	if cfg.Tasks[0].Destination != "" || cfg.Tasks[0].Retention.Daily != nil || cfg.Tasks[0].MaxBackupBytes != "" {
 		t.Fatalf("a logclean task gained backup fields: %+v", cfg.Tasks[0])
 	}
 }

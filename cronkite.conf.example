@@ -96,3 +96,11 @@ tasks:
   #   # so a run proves it can restore instead of assuming it. At least one file
   #   # is always verified. Default: 10.
   #   verify_sample_percent: 10
+  #   # The most one run may copy, in the same size syntax as the run ceilings.
+  #   # Bytes relinked from the previous snapshot are not counted: a hardlink
+  #   # stores nothing new, so the ceiling bounds what a snapshot adds to the
+  #   # disk, not the size of the tree. A run whose plan would copy more is
+  #   # refused before anything is written, and `cronkite plan` refuses too, so
+  #   # the limit is visible without a run. Raise it deliberately for the first
+  #   # snapshot of a large tree. Default: 5GiB.
+  #   max_backup_bytes: "5GiB"

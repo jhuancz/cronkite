@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -76,8 +77,9 @@ func kinds(actions []task.Action) []report.ActionKind {
 
 func notes(plan *task.Plan) string { return strings.Join(plan.Notes, "\n") }
 
-// Plan must report the shape of the work and touch nothing: no destination
-// directory, no staging tree, no snapshot.
+// Plan must report the work as two aggregate actions and touch nothing: no
+// destination directory, no staging tree, no snapshot. A backup does not plan
+// per file.
 func TestPlanReportsWorkAndWritesNothing(t *testing.T) {
 	cfg, src, dest := backupConfig(t)
 	tk := newTask(t, cfg)
@@ -86,11 +88,17 @@ func TestPlanReportsWorkAndWritesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	if len(plan.Actions) != 0 {
-		t.Fatalf("a backup plan has no per-file actions, got %+v", plan.Actions)
+	// One action for the bytes a run would write, one for the bytes it would
+	// reuse, and nothing per file.
+	if len(plan.Actions) != 1 {
+		t.Fatalf("plan actions = %+v, want one aggregate write action for a first run", plan.Actions)
 	}
+	if got := plan.Actions[0]; got.Kind != actionWrite || got.Size != 20 {
+		t.Fatalf("plan action = %+v, want one %q action for 20 B", got, actionWrite)
+	}
+
 	got := notes(plan)
-	for _, want := range []string{src, dest, "2 files", "20 B", "no previous snapshot"} {
+	for _, want := range []string{src, dest, "2 files", "2 to copy (20 B)", "0 to relink (0 B)", "no previous snapshot"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("notes should mention %q, got:\n%s", want, got)
 		}
@@ -100,7 +108,8 @@ func TestPlanReportsWorkAndWritesNothing(t *testing.T) {
 	}
 }
 
-// The second plan can tell the operator that a run would relink instead of copy.
+// The second plan can tell the operator that a run would relink instead of copy,
+// and still creates nothing.
 func TestPlanNotesThePreviousSnapshot(t *testing.T) {
 	cfg, _, dest := backupConfig(t)
 	tk := newTask(t, cfg)
@@ -112,9 +121,158 @@ func TestPlanNotesThePreviousSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != actionRelink || plan.Actions[0].Size != 20 {
+		t.Fatalf("plan actions = %+v, want one aggregate relink action for 20 B", plan.Actions)
+	}
 	got := notes(plan)
-	if !strings.Contains(got, dest) || !strings.Contains(got, "hardlinked") {
-		t.Fatalf("notes should name the previous snapshot and the relink, got:\n%s", got)
+	for _, want := range []string{dest, "hardlinked", "0 to copy (0 B)", "2 to relink (20 B)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notes should mention %q, got:\n%s", want, got)
+		}
+	}
+	if len(names(t, dest)) != 1 {
+		t.Fatalf("plan mode must not write a snapshot, destination holds %v", names(t, dest))
+	}
+}
+
+// The figures a plan reports are the figures the run produces, on a first run and
+// on a rerun after one file changed. Both read the same decision, so the plan
+// cannot promise a copy the run relinks, or the other way round.
+func TestPlanNumbersMatchWhatApplyDoes(t *testing.T) {
+	cfg, src, _ := backupConfig(t)
+	tk := newTask(t, cfg)
+	ctx := context.Background()
+
+	plan, err := tk.Plan(ctx, task.Env{Mode: report.ModePlan, Now: day(1)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	first, err := tk.Apply(ctx, plan, task.Env{Mode: report.ModeApply, Now: day(1)})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	assertPlanMatchesResult(t, plan, first)
+
+	// One file changes: the plan must predict one copy and one relink, and the
+	// run must then do exactly that.
+	changed := writeFile(t, src, "app.conf", "listen=9090 and more\n")
+	written := day(1).Add(time.Hour)
+	if err := os.Chtimes(changed, written, written); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err = tk.Plan(ctx, task.Env{Mode: report.ModePlan, Now: day(2)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	second, err := tk.Apply(ctx, plan, task.Env{Mode: report.ModeApply, Now: day(2)})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	assertPlanMatchesResult(t, plan, second)
+}
+
+// assertPlanMatchesResult compares the plan an operator was shown with the work
+// the run reported: bytes through the aggregate actions, file counts through the
+// note that carries them.
+func assertPlanMatchesResult(t *testing.T, plan *task.Plan, res *task.Result) {
+	t.Helper()
+
+	var written, relinked int
+	var bytesWritten, bytesRelinked int64
+	for _, a := range res.Done {
+		switch a.Kind {
+		case actionWrite:
+			written++
+			bytesWritten += a.Size
+		case actionRelink:
+			relinked++
+			bytesRelinked += a.Size
+		}
+	}
+
+	planned := map[report.ActionKind]int64{}
+	for _, a := range plan.Actions {
+		planned[a.Kind] += a.Size
+	}
+	if got := planned[actionWrite]; got != bytesWritten {
+		t.Errorf("the plan would copy %d bytes, the run wrote %d", got, bytesWritten)
+	}
+	if got := planned[actionRelink]; got != bytesRelinked {
+		t.Errorf("the plan would relink %d bytes, the run relinked %d", got, bytesRelinked)
+	}
+
+	got := notes(plan)
+	for _, want := range []string{
+		fmt.Sprintf("%d to copy", written),
+		fmt.Sprintf("%d to relink", relinked),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notes should mention %q, got:\n%s", want, got)
+		}
+	}
+}
+
+// The ceiling refuses a rehearsal, so an operator learns about it without
+// running, and it refuses a run before anything is written.
+func TestMaxBackupBytesRefusesBeforeWriting(t *testing.T) {
+	cfg, _, dest := backupConfig(t)
+	cfg.MaxBackupBytes = "10B" // the source tree holds 20 B
+	tk := newTask(t, cfg)
+
+	_, err := tk.Plan(context.Background(), task.Env{Mode: report.ModePlan, Now: day(1)})
+	if err == nil {
+		t.Fatal("a rehearsal above max_backup_bytes must be refused")
+	}
+	for _, want := range []string{"20 B", "10 B", "max_backup_bytes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should mention %q, got: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("a refused rehearsal must not create the destination, stat err = %v", statErr)
+	}
+
+	// Apply judges the plan it is handed, and refuses before writing anything.
+	over := &task.Plan{Actions: []task.Action{{Path: dest, Kind: actionWrite, Size: 40}}}
+	res, err := tk.Apply(context.Background(), over, task.Env{Mode: report.ModeApply, Now: day(1)})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(res.Failed) != 1 {
+		t.Fatalf("failures = %+v, want the refusal", res.Failed)
+	}
+	msg := res.Failed[0].Err.Error()
+	for _, want := range []string{"40 B", "10 B", "max_backup_bytes"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("failure should mention %q, got: %v", want, msg)
+		}
+	}
+	if len(res.Done) != 0 {
+		t.Fatalf("a refused run must not report done work, got %+v", res.Done)
+	}
+	if _, statErr := os.Stat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("a refused run must not write a snapshot, stat err = %v", statErr)
+	}
+}
+
+// The ceiling bounds what a run adds, not the size of the tree: bytes reused from
+// the previous snapshot cost no disk, so a run that only relinks fits under any
+// ceiling.
+func TestMaxBackupBytesIgnoresRelinkedBytes(t *testing.T) {
+	cfg, _, dest := backupConfig(t)
+	if _, err := newTask(t, cfg).Apply(context.Background(), &task.Plan{}, task.Env{Mode: report.ModeApply, Now: day(1)}); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+
+	cfg.MaxBackupBytes = "1B"
+	tk := newTask(t, cfg)
+	plan, err := tk.Plan(context.Background(), task.Env{Mode: report.ModePlan, Now: day(2)})
+	if err != nil {
+		t.Fatalf("a run that would only relink must fit under any ceiling: %v", err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != actionRelink || plan.Actions[0].Size != 20 {
+		t.Fatalf("plan actions = %+v, want one aggregate relink action for 20 B", plan.Actions)
 	}
 	if len(names(t, dest)) != 1 {
 		t.Fatalf("plan mode must not write a snapshot, destination holds %v", names(t, dest))

@@ -62,6 +62,57 @@ Adding a task type means implementing this interface and adding one case to
 `internal/tasks.Build` — the explicit switch keeps the supported surface
 greppable.
 
+## Backup task type (v0.2.0)
+
+A `backup` task publishes incremental, verified snapshots of one source tree
+under `destination/<UTC timestamp>/`.
+
+What it does:
+
+- **Writes a snapshot you can restore with `cp`.** A snapshot is a plain
+directory holding a full copy of the tree plus a `manifest.json`, not an archive
+and not a format. Restoring is `cp -a <snapshot>/. <where>/` (or the Windows
+equivalent); no cronkite binary and no restore tool is involved, so a snapshot
+outlives the tool that wrote it.
+- **Reuses unchanged files with hardlinks.** A file is shared with the previous
+snapshot when its size and modification time match the previous record and,
+under the default checksum policy, its content digest still matches. The disk
+holds one inode per distinct content, and every snapshot stays complete on its
+own.
+- **Verifies after writing.** A sample of the snapshot (`verify_sample_percent`,
+default 10, at least one file) is re-hashed against the manifest, and every
+relinked entry is re-read **from the source** and compared with the digest it
+inherited. The second check is the only one that notices a file that changed
+while its size and mtime stayed the same, and it is why a relink does not have
+to re-read the whole tree while it copies.
+- **Keeps whole snapshots.** Retention (`retention.daily`, `retention.weekly`)
+counts snapshots of a UTC day and of an ISO week, not calendar age, deletes only
+entire snapshot directories, and never the newest one. A snapshot whose index
+cannot be read is reported and left alone rather than judged.
+- **Refuses rather than guesses.** `max_backup_bytes` bounds the bytes one run
+may copy; relinked bytes are not charged against it, because they store nothing
+new. A plan above the ceiling is refused before anything is written, in a
+rehearsal and in a run alike.
+- **Reports the same shape in both modes.** `cronkite plan -task <name>` walks the
+source, compares it with the newest readable snapshot using the writer's own
+decision, and reports the bytes it would copy and the bytes it would reuse. It
+creates nothing: no destination directory, no snapshot.
+
+What it does not do:
+
+- **No compression, encryption or off-site copy.** A snapshot is as large as the
+distinct bytes it holds and lives where the destination points; shipping it
+elsewhere is the operator's job.
+- **No per-file selection.** The whole source tree goes in, minus symlinks,
+special files, unreadable entries and a source file named `manifest.json` at the
+root, which are reported as skipped with a reason.
+- **No application-consistent view.** Files are read while the application keeps
+writing, so a snapshot is crash-consistent, not transactionally consistent; a
+file that changes during the copy is simply written again next run.
+- **No hardlink guarantee.** A destination on another filesystem, or an
+unprivileged Windows run, falls back to copying. Each fallback is recorded in
+the report, never silent.
+
 ## Script task type (v0.2.0)
 
 Site-specific maintenance does not belong in a second cron entry with its own

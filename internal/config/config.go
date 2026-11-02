@@ -39,6 +39,11 @@ const (
 	DefaultRetentionDaily  = 7
 	DefaultRetentionWeekly = 4
 	DefaultSamplePercent   = 10
+	// DefaultMaxBackupBytes is the most one snapshot may copy when the file does
+	// not say. It bounds what a mistyped backup can spend, in the spirit of
+	// run.safety: a first snapshot of a 200 GiB tree is a decision an operator
+	// has to make, not one a default should make for them.
+	DefaultMaxBackupBytes = "5GiB"
 )
 
 // Config is the parsed configuration file.
@@ -111,6 +116,12 @@ type Task struct {
 	// the source after it is written. Absent means DefaultSamplePercent, and at
 	// least one file is always verified.
 	VerifySamplePercent *int `yaml:"verify_sample_percent"`
+	// MaxBackupBytes is the ceiling on the bytes one run may copy. Bytes the
+	// previous snapshot supplies are not counted against it: a relink stores
+	// nothing new, so charging it would refuse exactly the incremental snapshots
+	// this task exists to take. A run whose plan would copy more is refused
+	// before anything is written. Absent means DefaultMaxBackupBytes.
+	MaxBackupBytes string `yaml:"max_backup_bytes"`
 
 	// UnresolvedRoots holds roots whose path depends on an environment
 	// variable that is not set here. One configuration is meant to be shared
@@ -304,6 +315,12 @@ func (c *Config) normalize() error {
 			if t.VerifySamplePercent == nil {
 				t.VerifySamplePercent = intPtr(DefaultSamplePercent)
 			}
+			// The ceiling is required for every backup task, because the delete
+			// ceilings of run.safety describe removals and cannot stand in for it.
+			t.MaxBackupBytes = firstNonEmpty(t.MaxBackupBytes, DefaultMaxBackupBytes)
+			if _, err := t.BackupBytes(); err != nil {
+				add("%s: %v", where, err)
+			}
 		}
 		if t.Retention.Daily != nil && *t.Retention.Daily < 0 {
 			add("%s: retention.daily must not be negative (0 turns the daily rule off)", where)
@@ -352,6 +369,24 @@ func (c *Config) SafetyBytes() int64 {
 		return 0
 	}
 	return n
+}
+
+// BackupBytes returns max_backup_bytes in bytes, applying the documented default
+// when the file does not set one. Call after Load.
+//
+// A value that cannot be parsed or that is not positive is an error rather than
+// a silent zero: a ceiling read as zero would refuse every snapshot, and a
+// ceiling read as unlimited would enforce nothing.
+func (t Task) BackupBytes() (int64, error) {
+	limit := firstNonEmpty(t.MaxBackupBytes, DefaultMaxBackupBytes)
+	n, err := bytesx.Parse(limit)
+	if err != nil {
+		return 0, fmt.Errorf("max_backup_bytes: %w", err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("max_backup_bytes is %q: a ceiling of zero refuses every snapshot", limit)
+	}
+	return n, nil
 }
 
 // TaskNames returns the configured task names in file order.

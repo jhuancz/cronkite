@@ -245,12 +245,7 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	// Resolved once, not per file: the operating system may address the same
 	// directory through a symlinked ancestor (macOS /var is /private/var), and the
 	// containment check for a relink target has to compare real paths.
-	prevResolved := prevDir
-	if prevDir != "" {
-		if resolved, err := filepath.EvalSymlinks(prevDir); err == nil {
-			prevResolved = resolved
-		}
-	}
+	prevResolved := resolveSnapshot(prevDir)
 
 	manifest := NewManifest()
 	// Directories whose entry list changed, so each one can be flushed before the
@@ -268,94 +263,57 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 		}
 
 		relSlash := filepath.ToSlash(rel)
-		// The index of the snapshot lives at the root of the snapshot. A source
-		// entry with that name - file or directory, in any case, because macOS
-		// and Windows resolve names case-insensitively - would collide with it,
-		// so it is left out and reported instead of failing the whole snapshot.
-		if path.Dir(relSlash) == "." && strings.EqualFold(relSlash, ManifestName) {
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonReservedName})
-			if d.IsDir() {
-				// The whole subtree belongs to the collision, not just the entry.
+		// What a snapshot does with an entry is decided in one place, shared with
+		// Plan: a rehearsal that counted a file a run would leave out would be
+		// describing a different snapshot.
+		f := classify(relSlash, d)
+		if f.Skip != nil {
+			res.Skipped = append(res.Skipped, *f.Skip)
+			if f.SkipTree {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if d.IsDir() {
-			if !representable(relSlash) {
-				res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRepresentable})
-				// Nothing below it can be represented either: every path in the
-				// subtree carries the same component.
-				return fs.SkipDir
-			}
-			info, err := d.Info()
-			if err != nil {
-				res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonUnreadable})
-				return fs.SkipDir
-			}
 
-			dst := filepath.Join(stage, filepath.FromSlash(relSlash))
+		dst := filepath.Join(stage, filepath.FromSlash(relSlash))
+		if f.Dir != nil {
 			// Created even when it will hold nothing: an application that loses its
 			// upload or cache directory has not been restored.
 			if err := os.MkdirAll(dst, 0o755); err != nil {
 				return fmt.Errorf("create %s: %w", dst, err)
 			}
 			collectSyncDirs(touchedDirs, &dirsToSync, stage, dst)
-			perm := info.Mode().Perm()
-			dirModes = append(dirModes, dirMode{path: dst, mode: perm})
-			return manifest.AddDir(Dir{Path: relSlash, ModTime: info.ModTime().UTC(), Mode: uint32(perm)})
+			dirModes = append(dirModes, dirMode{path: dst, mode: f.Perm})
+			return manifest.AddDir(*f.Dir)
 		}
 
-		switch {
-		case d.Type()&fs.ModeSymlink != 0:
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonSymlink})
-			return nil
-		case !d.Type().IsRegular():
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRegular})
-			return nil
-		case !representable(relSlash):
-			// The manifest refuses some names on purpose, so the walk has to
-			// refuse them first: one legacy file name must cost that file, never
-			// every snapshot this task will ever write.
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonNotRepresentable})
-			return nil
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			res.Skipped = append(res.Skipped, Skip{Path: relSlash, Reason: ReasonUnreadable})
-			return nil
-		}
-
-		dst := filepath.Join(stage, filepath.FromSlash(relSlash))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", filepath.Dir(dst), err)
 		}
 		collectSyncDirs(touchedDirs, &dirsToSync, stage, filepath.Dir(dst))
-		entry := Entry{Path: relSlash, Size: info.Size(), ModTime: info.ModTime().UTC()}
+		entry := *f.File
 
-		// Incrementality is decided from the manifest, not from the source: a
-		// file whose size and mtime match the previous record, and which is
-		// still there, is the same bytes with the same digest.
-		if shared, ok := prev.Lookup(relSlash); ok && w.relinkable(relSlash, shared, entry) {
-			if target, ok := relinkTarget(prevResolved, relSlash, shared); ok {
-				err := w.link(target, dst)
-				if err == nil {
-					res.Relinked++
-					if w.mode != RelinkChecksum {
-						res.RelinkedUnverified++
-					}
-					res.BytesRelinked += shared.Size
-					res.Files = append(res.Files, Written{Path: relSlash, Size: shared.Size, Shared: true})
-					return manifest.Add(shared)
+		// Incrementality is decided from the manifest, not from the source, and
+		// by the same helper Plan calls: a file whose record still matches the
+		// source is supplied by the previous snapshot, everything else is copied.
+		if target, shared, ok := w.relinkSource(prev, prevResolved, relSlash, entry); ok {
+			err := w.link(target, dst)
+			if err == nil {
+				res.Relinked++
+				if w.mode != RelinkChecksum {
+					res.RelinkedUnverified++
 				}
-				// A hardlink needs both snapshots on one filesystem, and a Windows
-				// run needs the privilege for it. Copying is the right answer;
-				// doing it quietly is not.
-				res.Fallbacks = append(res.Fallbacks, Fallback{Path: relSlash, Reason: err.Error()})
+				res.BytesRelinked += shared.Size
+				res.Files = append(res.Files, Written{Path: relSlash, Size: shared.Size, Shared: true})
+				return manifest.Add(shared)
 			}
+			// A hardlink needs both snapshots on one filesystem, and a Windows run
+			// needs the privilege for it. Copying is the right answer; doing it
+			// quietly is not.
+			res.Fallbacks = append(res.Fallbacks, Fallback{Path: relSlash, Reason: err.Error()})
 		}
 
-		digest, size, err := w.copyFile(dst, relSlash, info.Mode().Perm(), entry.ModTime)
+		digest, size, err := w.copyFile(dst, relSlash, f.Perm, entry.ModTime)
 		if err != nil {
 			return fmt.Errorf("copy %s: %w", relSlash, err)
 		}
@@ -412,6 +370,202 @@ func (w *Writer) Write(ctx context.Context, now time.Time) (*Result, error) {
 	res.Snapshot = final
 	res.Digest = manifest.Digest
 	return res, nil
+}
+
+// Plan is what a snapshot would do, decided without writing anything.
+//
+// It is the rehearsal of one Write: the same files, the same skips, the same
+// relink decision, and the same byte counts, computed from a read-only walk and
+// the manifest of the newest readable snapshot.
+type Plan struct {
+	// Snapshot is the directory a run at the planned time would publish.
+	Snapshot string `json:"snapshot"`
+	// Previous is the snapshot a run would relink against. Empty when the
+	// destination holds no readable snapshot yet.
+	Previous string `json:"previous,omitempty"`
+	// Copied is the number of files whose bytes a run would write.
+	Copied int `json:"files_copied"`
+	// Relinked is the number of files a run would share with Previous.
+	Relinked int `json:"files_relinked"`
+	// BytesCopied is the number of bytes a run would read from the source and
+	// write. It is the figure a size ceiling is about.
+	BytesCopied int64 `json:"bytes_copied"`
+	// BytesRelinked is the number of bytes the previous snapshot would supply,
+	// which is what a run would not have to store again.
+	BytesRelinked int64 `json:"bytes_deduplicated"`
+	// Skipped are the source entries a run would leave out, with the reason.
+	Skipped []Skip `json:"skipped,omitempty"`
+}
+
+// Files is the number of files a planned snapshot would hold.
+func (p *Plan) Files() int { return p.Copied + p.Relinked }
+
+// Plan reports the snapshot a Write at now would publish, and creates nothing.
+//
+// Every decision comes from the code the writer runs: classify decides what
+// belongs in a snapshot, relinkSource decides what the newest readable snapshot
+// may supply, and both are called here rather than reimplemented, because a plan
+// that drifts from the run it describes is worse than no plan. Under the default
+// RelinkChecksum policy that means hashing each candidate for relinking, exactly
+// the cost a run pays to prove it may skip the copy.
+//
+// Two things a plan cannot know, and therefore does not promise: whether the
+// filesystem will refuse a hardlink (a fallback copies the file, so the run
+// copies more than the plan said), and whether a source file changes between the
+// rehearsal and the run. Nothing is created here - no destination directory, no
+// staging tree, no snapshot - so a rehearsal of a fresh destination leaves no
+// trace at all.
+func (w *Writer) Plan(ctx context.Context, now time.Time) (*Plan, error) {
+	res := &Plan{Snapshot: filepath.Join(w.dest, now.UTC().Format(snapshotTimeLayout))}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	prevDir, prev, err := w.previous()
+	if err != nil {
+		return nil, err
+	}
+	res.Previous = prevDir
+	prevResolved := resolveSnapshot(prevDir)
+
+	walkErr := w.source.Walk(0, func(abs, rel string, d fs.DirEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		relSlash := filepath.ToSlash(rel)
+		f := classify(relSlash, d)
+		if f.Skip != nil {
+			res.Skipped = append(res.Skipped, *f.Skip)
+			if f.SkipTree {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if f.Dir != nil {
+			// Directories carry no bytes and are recreated by the run; they are
+			// not part of what an operator plans against.
+			return nil
+		}
+
+		if _, shared, ok := w.relinkSource(prev, prevResolved, relSlash, *f.File); ok {
+			res.Relinked++
+			res.BytesRelinked += shared.Size
+			return nil
+		}
+		res.Copied++
+		res.BytesCopied += f.File.Size
+		return nil
+	}, func(abs string, err error) {
+		res.Skipped = append(res.Skipped, Skip{Path: w.relSlash(abs), Reason: ReasonUnreadable})
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("walk source %s: %w", w.source.Dir(), walkErr)
+	}
+	return res, nil
+}
+
+// fate is what a snapshot does with one source entry.
+//
+// It is the vocabulary Plan and Write share: an entry is either left out (with
+// the reason), a directory the snapshot recreates, or a file the snapshot holds.
+type fate struct {
+	// Skip is set when the entry is left out of the snapshot.
+	Skip *Skip
+	// SkipTree reports that everything below the entry is left out as well.
+	SkipTree bool
+	// Dir is the directory record a snapshot holds for the entry.
+	Dir *Dir
+	// File is the file record a snapshot would hold, with size and mtime but no
+	// digest: the digest is only known once the bytes are read.
+	File *Entry
+	// Perm are the source permission bits, which a snapshot reproduces.
+	Perm fs.FileMode
+}
+
+// classify decides what a snapshot does with one source entry.
+//
+// The rules live in one function because both the writer and the planner ask the
+// same question, and because each rule is a way for content to enter or leave a
+// snapshot that must not differ between them: the manifest's own name is refused
+// at the root (a file or a directory, in any case, because macOS and Windows
+// resolve names case-insensitively), a name the manifest cannot express costs
+// that file and never the snapshot, symlinks and special files are left out, and
+// metadata that cannot be read is reported rather than silently dropped.
+func classify(relSlash string, d fs.DirEntry) fate {
+	if path.Dir(relSlash) == "." && strings.EqualFold(relSlash, ManifestName) {
+		// The whole subtree belongs to the collision, not just the entry.
+		return fate{Skip: &Skip{Path: relSlash, Reason: ReasonReservedName}, SkipTree: d.IsDir()}
+	}
+
+	if d.IsDir() {
+		if !representable(relSlash) {
+			// Nothing below it can be represented either: every path in the
+			// subtree carries the same component.
+			return fate{Skip: &Skip{Path: relSlash, Reason: ReasonNotRepresentable}, SkipTree: true}
+		}
+		info, err := d.Info()
+		if err != nil {
+			return fate{Skip: &Skip{Path: relSlash, Reason: ReasonUnreadable}, SkipTree: true}
+		}
+		perm := info.Mode().Perm()
+		return fate{
+			Dir:  &Dir{Path: relSlash, ModTime: info.ModTime().UTC(), Mode: uint32(perm)},
+			Perm: perm,
+		}
+	}
+
+	switch {
+	case d.Type()&fs.ModeSymlink != 0:
+		return fate{Skip: &Skip{Path: relSlash, Reason: ReasonSymlink}}
+	case !d.Type().IsRegular():
+		return fate{Skip: &Skip{Path: relSlash, Reason: ReasonNotRegular}}
+	case !representable(relSlash):
+		// The manifest refuses some names on purpose, so the walk has to refuse
+		// them first: one legacy file name must cost that file, never every
+		// snapshot this task will ever write.
+		return fate{Skip: &Skip{Path: relSlash, Reason: ReasonNotRepresentable}}
+	}
+
+	info, err := d.Info()
+	if err != nil {
+		return fate{Skip: &Skip{Path: relSlash, Reason: ReasonUnreadable}}
+	}
+	return fate{
+		File: &Entry{Path: relSlash, Size: info.Size(), ModTime: info.ModTime().UTC()},
+		Perm: info.Mode().Perm(),
+	}
+}
+
+// relinkSource decides whether the previous snapshot supplies this file, and
+// returns the link target together with the record it supplies.
+//
+// It is the single decision behind incrementality, so Plan and Write cannot
+// disagree: a file the previous snapshot may supply is counted as a relink by
+// both, and one it may not is copied by both.
+func (w *Writer) relinkSource(prev *Manifest, prevResolved, rel string, entry Entry) (string, Entry, bool) {
+	shared, ok := prev.Lookup(rel)
+	if !ok || !w.relinkable(rel, shared, entry) {
+		return "", Entry{}, false
+	}
+	target, ok := relinkTarget(prevResolved, rel, shared)
+	if !ok {
+		return "", Entry{}, false
+	}
+	return target, shared, true
+}
+
+// resolveSnapshot returns the real path of a snapshot directory, so the
+// containment check for a relink target compares like with like when an ancestor
+// is a symlink. An unknown directory resolves to itself.
+func resolveSnapshot(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		return resolved
+	}
+	return dir
 }
 
 // collectSyncDirs records dir and its ancestors below stage, so every directory

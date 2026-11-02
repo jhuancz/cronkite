@@ -16,7 +16,6 @@ package backup
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 	"strings"
 
@@ -43,8 +42,12 @@ type Task struct {
 	dest   string
 	policy snapshot.PrunePolicy
 	verify int
-	guard  *fsx.Guard
-	writer *snapshot.Writer
+	// maxBytes is the ceiling on the bytes one run may copy. Relinked bytes are
+	// not charged against it: they cost no disk, so counting them would refuse
+	// the incremental run this task exists to take.
+	maxBytes int64
+	guard    *fsx.Guard
+	writer   *snapshot.Writer
 }
 
 // New validates the task configuration, opens its source root and prepares the
@@ -60,6 +63,10 @@ func New(cfg config.Task) (*Task, error) {
 	}
 	if cfg.Destination == "" {
 		return nil, fmt.Errorf("task %s: destination is required for a backup task", cfg.Name)
+	}
+	maxBytes, err := cfg.BackupBytes()
+	if err != nil {
+		return nil, fmt.Errorf("task %s: %w", cfg.Name, err)
 	}
 
 	guard, err := fsx.NewGuard(cfg.Roots, cfg.Protect)
@@ -97,12 +104,13 @@ func New(cfg config.Task) (*Task, error) {
 	}
 
 	return &Task{
-		name:   cfg.Name,
-		dest:   cfg.Destination,
-		policy: snapshot.PrunePolicy{Daily: daily, Weekly: weekly},
-		verify: verify,
-		guard:  guard,
-		writer: writer,
+		name:     cfg.Name,
+		dest:     cfg.Destination,
+		policy:   snapshot.PrunePolicy{Daily: daily, Weekly: weekly},
+		verify:   verify,
+		maxBytes: maxBytes,
+		guard:    guard,
+		writer:   writer,
 	}, nil
 }
 
@@ -121,87 +129,108 @@ func (t *Task) Close() error {
 	return err
 }
 
-// sourceStats is what a plan needs to know about a source tree without reading
-// its bytes.
-type sourceStats struct {
-	files   int
-	bytes   int64
-	skipped int
-}
-
-// Plan reports the shape of the work a run would do, and changes nothing.
+// Plan reports what a run would do, and changes nothing.
 //
-// A backup's unit of work is the snapshot, not a file, so this plan carries no
-// per-file actions: a run creates one directory and publishes it with a single
-// rename, and a list of files would offer the operator a choice to approve or
-// skip one at a time that no code path can honour. What a run would do is
-// reported as notes instead - how many files and bytes it would hold, and
-// whether there is a previous snapshot to relink against. Nothing here writes:
-// no destination directory is created and no snapshot is staged.
+// A backup does not plan per file. One run builds one directory and publishes it
+// with a single rename, so a list of files would offer an operator an approval
+// step that no code path can honour: skipping one file would leave a snapshot
+// that is not the tree it claims to restore. The work is therefore reported as
+// two aggregate actions - the bytes a run would write and the bytes it would
+// reuse - and the file counts behind them as notes.
+//
+// Nothing here writes: no destination directory is created and no snapshot is
+// staged. The figures come from internal/backup's read-only walk, which calls the
+// same decisions the writer does, so a rehearsal and the run that follows it
+// agree about every file.
 func (t *Task) Plan(ctx context.Context, env task.Env) (*task.Plan, error) {
 	plan := &task.Plan{}
 
-	stats, err := t.scan(ctx)
-	if err != nil {
-		return nil, err
-	}
-	source := t.guard.Roots()[0].Dir()
-
-	plan.Notes = append(plan.Notes, fmt.Sprintf(
-		"a run would publish one snapshot of %s in %s, holding %d files (%s)",
-		source, t.dest, stats.files, bytesx.Format(stats.bytes)))
-
-	previous, err := snapshot.Snapshots(t.dest)
+	rehearsal, err := t.writer.Plan(ctx, env.Now)
 	if err != nil {
 		return nil, fmt.Errorf("task %s: %w", t.name, err)
 	}
-	if len(previous) == 0 {
+
+	if rehearsal.Copied > 0 {
+		plan.Actions = append(plan.Actions, task.Action{
+			Path: rehearsal.Snapshot,
+			Kind: actionWrite,
+			Size: rehearsal.BytesCopied,
+		})
+	}
+	if rehearsal.Relinked > 0 {
+		plan.Actions = append(plan.Actions, task.Action{
+			Path: rehearsal.Previous,
+			Kind: actionRelink,
+			Size: rehearsal.BytesRelinked,
+		})
+	}
+
+	source := t.guard.Roots()[0].Dir()
+	for _, s := range rehearsal.Skipped {
+		plan.Skipped = append(plan.Skipped, task.Action{
+			Path:   filepath.Join(source, filepath.FromSlash(s.Path)),
+			Reason: s.Reason,
+		})
+	}
+
+	// The two aggregate actions carry the bytes; these notes carry the file
+	// counts behind them, which is what an operator budgets against.
+	plan.Notes = append(plan.Notes, fmt.Sprintf(
+		"a run would publish one snapshot of %s in %s, holding %d files (%s): %d to copy (%s), %d to relink (%s)",
+		source, t.dest, rehearsal.Files(), bytesx.Format(rehearsal.BytesCopied+rehearsal.BytesRelinked),
+		rehearsal.Copied, bytesx.Format(rehearsal.BytesCopied),
+		rehearsal.Relinked, bytesx.Format(rehearsal.BytesRelinked)))
+	if rehearsal.Previous == "" {
 		plan.Notes = append(plan.Notes, fmt.Sprintf("no previous snapshot in %s: every file would be written", t.dest))
 	} else {
 		plan.Notes = append(plan.Notes, fmt.Sprintf(
-			"previous snapshot %s exists: unchanged files would be hardlinked from it instead of written",
-			previous[0].Path))
+			"previous snapshot %s: unchanged files would be hardlinked from it instead of written",
+			rehearsal.Previous))
 	}
-	if stats.skipped > 0 {
+	if len(rehearsal.Skipped) > 0 {
 		plan.Notes = append(plan.Notes, fmt.Sprintf(
 			"%d source entries would be left out: symlinks, special files and unreadable entries are never followed",
-			stats.skipped))
+			len(rehearsal.Skipped)))
+	}
+
+	// The ceiling is checked here so a rehearsal refuses instead of letting an
+	// operator discover it from a run that wrote nothing.
+	if err := t.checkCeiling(rehearsal.BytesCopied); err != nil {
+		return nil, err
 	}
 	return plan, nil
 }
 
-// scan walks the source through the guard, counting what a snapshot would hold.
+// checkCeiling refuses a plan whose bytes to copy exceed max_backup_bytes.
 //
-// It reads names and metadata only: plan mode must be as cheap as looking, and
-// hashing the tree to report exact bytes is the work of the run being planned.
-func (t *Task) scan(ctx context.Context) (sourceStats, error) {
-	var stats sourceStats
-	err := t.guard.Roots()[0].Walk(0, func(abs, _ string, d fs.DirEntry) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			stats.skipped++
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			stats.skipped++
-			return nil
-		}
-		stats.files++
-		stats.bytes += info.Size()
+// The message names the three things an operator needs to decide what to do:
+// what the plan would copy, what the ceiling is, and which setting changes the
+// outcome.
+func (t *Task) checkCeiling(bytesToCopy int64) error {
+	if bytesToCopy <= t.maxBytes {
 		return nil
-	}, func(_ string, _ error) {
-		stats.skipped++
-	})
-	if err != nil {
-		return stats, fmt.Errorf("task %s: walk source %s: %w", t.name, t.guard.Roots()[0].Dir(), err)
 	}
-	return stats, nil
+	return fmt.Errorf(
+		"task %s: the plan would copy %s into %s, above max_backup_bytes (%s); nothing was written. Raise max_backup_bytes to cover this copy, or narrow roots so one snapshot is smaller",
+		t.name, bytesx.Format(bytesToCopy), t.dest, bytesx.Format(t.maxBytes),
+	)
+}
+
+// plannedBytesToCopy is the part of a plan that costs disk: the aggregate write
+// action this task's Plan produces. Relinked bytes are deliberately excluded,
+// because a hardlink stores nothing new and charging it would refuse exactly the
+// runs an incremental backup is meant to make cheap.
+func plannedBytesToCopy(plan *task.Plan) int64 {
+	if plan == nil {
+		return 0
+	}
+	var total int64
+	for _, a := range plan.Actions {
+		if a.Kind == actionWrite {
+			total += a.Size
+		}
+	}
+	return total
 }
 
 // Apply writes one snapshot, verifies a sample of it against the source, and
@@ -214,6 +243,15 @@ func (t *Task) scan(ctx context.Context) (sourceStats, error) {
 // nothing was published and there is nothing to report as done.
 func (t *Task) Apply(ctx context.Context, plan *task.Plan, env task.Env) (*task.Result, error) {
 	res := &task.Result{}
+
+	// The ceiling is enforced against the plan that is about to be executed, so a
+	// run refuses before it writes anything. Plan has already refused a plan of
+	// its own making that was too large; this also covers a plan built by a
+	// caller, and it judges the same figure the operator was shown.
+	if err := t.checkCeiling(plannedBytesToCopy(plan)); err != nil {
+		res.Failed = append(res.Failed, task.Failure{Path: t.dest, Err: err})
+		return res, nil
+	}
 
 	written, err := t.writer.Write(ctx, env.Now)
 	if err != nil {
