@@ -113,25 +113,28 @@ file that changes during the copy is simply written again next run.
 unprivileged Windows run, falls back to copying. Each fallback is recorded in
 the report, never silent.
 
-## Script task type (v0.2.0)
+## Script task type
 
 Site-specific maintenance does not belong in a second cron entry with its own
-logging, locking and alerting. The `script` task will run a shell or PowerShell
-script as part of the run, under the same lock and the same report.
+logging, locking and alerting. The `script` task runs a shell or PowerShell file
+as part of the run, under the same lock, the same report and the same rehearsal.
 
-Contract for the script:
+The contract, which `examples/maintenance.sh` and `examples/maintenance.ps1`
+implement:
 
 | Aspect | Rule |
 | --- | --- |
-| Interpreter | `bash`, `sh` or `powershell`, resolved from `PATH`. |
-| Environment | `CRONKITE_RUN_ID`, `CRONKITE_MODE` (`plan`/`apply`), `CRONKITE_DRY_RUN` (`1`/`0`), `CRONKITE_TASK`. |
-| Dry run | The script must honour `CRONKITE_DRY_RUN=1` and describe its intent without mutating. |
-| Exit code | `0` success; non-zero is a task failure recorded in the report. |
-| Timeout | `timeout` on the task; exceeding it kills the process tree and records a failure. |
-| Output | Free-form text goes to the report as notes, capped by `report.max_actions_per_task`. |
+| Interpreter | `bash`, `sh` or `powershell`, resolved from `PATH` when the task is built, so a missing interpreter fails at start-up rather than at 03:00. |
+| File | An absolute path to a regular file the operator named. cronkite never downloads or generates a script. |
+| Environment | `CRONKITE_RUN_ID` (the id of the report this run writes, so a script's own log can be matched against it), `CRONKITE_MODE` (`plan`/`apply`), `CRONKITE_DRY_RUN` (`1`/`0`), `CRONKITE_TASK`. The inherited environment is passed through. |
+| Dry run | The script must honour `CRONKITE_DRY_RUN=1` and describe its intent without mutating. A rehearsal executes nothing, so this is the only thing that makes plan mode meaningful for a script. |
+| Exit code | `0` is success; anything else is a task failure carrying the status and the tail of the output. The run continues with the next task, exactly as a failed deletion does. |
+| Timeout | `timeout` on the task, 5m by default. Exceeding it kills the **process group**, not the direct child, so work the script spawned cannot outlive the run. On platforms without process groups only the direct child is killed, and the report says the task timed out. |
+| Output | stdout and stderr are captured into the task's notes, capped at 8 KiB per stream with an explicit truncation note. Output is never printed to the terminal verbatim: the report is where it belongs. |
+| Actions | None. cronkite did not measure any file change, so the report records a script through its notes and failures rather than inventing work in the totals. |
 
-Scripts run under the same ceilings and appear in the same report as native
-tasks, which is the point: one run, one audit trail.
+Scripts appear in the same report as native tasks, which is the point: one run,
+one audit trail, one place to look after something went wrong.
 
 ## Report schema versioning
 
