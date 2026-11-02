@@ -283,11 +283,13 @@ func taskReport(j *job, mode report.Mode, maxActions int) report.Task {
 		if j.result != nil {
 			add(&rt.Actions, j.result.Done)
 			add(&rt.Actions, j.result.Skipped)
-			rt.Totals.FilesRemoved = len(j.result.Done)
-			rt.Totals.DirsRemoved = j.result.DirsRemoved
+			// Each action is counted into the bucket its kind belongs to, so a
+			// backup writes and a cleanup frees; neither can be reported as the
+			// other. The task's own dir count stays authoritative.
 			for _, done := range j.result.Done {
-				rt.Totals.BytesFreed += done.Size
+				rt.Totals = rt.Totals.WithAction(done.Kind, done.Size)
 			}
+			rt.Totals.DirsRemoved = j.result.DirsRemoved
 			rt.Totals.Skipped += len(j.result.Skipped)
 			for _, f := range j.result.Failed {
 				rt.Errors = append(rt.Errors, report.Failure{Path: f.Path, Error: f.Err.Error()})

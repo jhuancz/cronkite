@@ -21,16 +21,20 @@ func Human(w io.Writer, r *Report) error {
 	fmt.Fprintf(w, "host %s (%s/%s)  config %s\n\n", r.Host.Hostname, r.Host.OS, r.Host.Arch, r.ConfigPath)
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "  TASK\tTYPE\tSTATUS\tPLANNED\t%s\tSIZE\tERRORS\n", strings.ToUpper(verb))
+	fmt.Fprintf(tw, "  TASK\tTYPE\tSTATUS\tPLANNED\t%s\tWRITTEN\tSIZE\tERRORS\n", strings.ToUpper(verb))
 	for _, task := range r.Tasks {
 		count := zeroDash(task.Totals.FilesRemoved)
-		size := task.Totals.BytesFreed
+		written := zeroDash(task.Totals.FilesWritten + task.Totals.FilesRelinked)
+		size := task.Totals.BytesFreed + task.Totals.BytesWritten + task.Totals.BytesRelinked
 		if r.Mode == ModePlan {
+			// A rehearsal has not written anything yet, so the written column
+			// stays empty instead of repeating the plan.
 			count = fmt.Sprintf("%d", task.Planned)
+			written = "-"
 			size = task.PlannedBytes
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%d\t%s\t%s\t%s\n",
-			task.Name, task.Type, task.Status, task.Planned, count,
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			task.Name, task.Type, task.Status, task.Planned, count, written,
 			bytesx.Format(size), zeroDash(task.Totals.Errors),
 		)
 	}
@@ -38,16 +42,30 @@ func Human(w io.Writer, r *Report) error {
 		return err
 	}
 
-	fileCount := r.Totals.FilesRemoved
+	// Each figure names its own unit. A run that only wrote files must not be
+	// summarised as having removed anything, and a backup that shares data with an
+	// earlier snapshot says how much of its work was a link rather than a copy.
+	parts := make([]string, 0, 3)
 	if r.Mode == ModePlan {
-		fileCount = r.Planned()
+		parts = append(parts, fmt.Sprintf("%s files, %s %s", zeroDash(r.Planned()), bytesx.Format(r.affectedBytes()), verb))
+	} else {
+		if r.Totals.FilesRemoved > 0 {
+			parts = append(parts, fmt.Sprintf("%d files, %s removed", r.Totals.FilesRemoved, bytesx.Format(r.Totals.BytesFreed)))
+		}
+		if written := r.Totals.FilesWritten + r.Totals.FilesRelinked; written > 0 {
+			detail := ""
+			if r.Totals.FilesRelinked > 0 {
+				detail = fmt.Sprintf(", %d reusing earlier data", r.Totals.FilesRelinked)
+			}
+			parts = append(parts, fmt.Sprintf("%d files written (%s%s)",
+				written, bytesx.Format(r.Totals.BytesWritten+r.Totals.BytesRelinked), detail))
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "nothing to do")
+		}
 	}
-	fmt.Fprintf(w, "\n  total: %s files, %s %s, %s skipped, %s errors\n",
-		zeroDash(fileCount),
-		bytesx.Format(r.affectedBytes()), verb,
-		zeroDash(r.Totals.Skipped),
-		zeroDash(r.Totals.Errors),
-	)
+	parts = append(parts, fmt.Sprintf("%s skipped, %s errors", zeroDash(r.Totals.Skipped), zeroDash(r.Totals.Errors)))
+	fmt.Fprintf(w, "\n  total: %s\n", strings.Join(parts, ", "))
 
 	if failures := failures(r); len(failures) > 0 {
 		fmt.Fprintf(w, "\n  failures:\n%s", indent(failures))
@@ -78,7 +96,7 @@ func (r *Report) Planned() int {
 // apply mode, what would be freed in plan mode.
 func (r *Report) affectedBytes() int64 {
 	if r.Mode != ModePlan {
-		return r.Totals.BytesFreed
+		return r.Totals.BytesFreed + r.Totals.BytesWritten + r.Totals.BytesRelinked
 	}
 	var total int64
 	for _, task := range r.Tasks {

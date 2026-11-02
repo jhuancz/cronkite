@@ -49,6 +49,14 @@ type ActionKind string
 const (
 	ActionDelete ActionKind = "delete"
 	ActionRmdir  ActionKind = "rmdir"
+	// ActionWrite marks a file written into a new location, which is what a
+	// backup does. It is deliberately not a deletion: reporting a backup as
+	// having removed data would make the report describe the opposite of what
+	// happened.
+	ActionWrite ActionKind = "write"
+	// ActionRelink marks a file shared with an earlier snapshot instead of being
+	// written again.
+	ActionRelink ActionKind = "relink"
 )
 
 // Report is one complete run.
@@ -86,21 +94,52 @@ type Host struct {
 // Totals are additive counters. They are always complete, even when the
 // per-task action list is truncated.
 type Totals struct {
-	FilesRemoved int   `json:"files_removed"`
-	DirsRemoved  int   `json:"dirs_removed"`
-	BytesFreed   int64 `json:"bytes_freed"`
-	Errors       int   `json:"errors"`
-	Skipped      int   `json:"skipped"`
+	FilesRemoved  int   `json:"files_removed"`
+	DirsRemoved   int   `json:"dirs_removed"`
+	BytesFreed    int64 `json:"bytes_freed"`
+	FilesWritten  int   `json:"files_written,omitempty"`
+	BytesWritten  int64 `json:"bytes_written,omitempty"`
+	FilesRelinked int   `json:"files_relinked,omitempty"`
+	BytesRelinked int64 `json:"bytes_relinked,omitempty"`
+	Errors        int   `json:"errors"`
+	Skipped       int   `json:"skipped"`
+}
+
+// WithAction counts one performed action into the bucket its kind belongs to.
+//
+// The split matters more than it looks: freed bytes and written bytes answer
+// different questions, and a report that confuses them describes a backup as a
+// deletion. An unknown kind is counted as work done rather than as data freed,
+// so no new task type can accidentally claim to have destroyed something.
+func (t Totals) WithAction(kind ActionKind, size int64) Totals {
+	switch kind {
+	case ActionDelete:
+		t.FilesRemoved++
+		t.BytesFreed += size
+	case ActionRmdir:
+		t.DirsRemoved++
+	case ActionRelink:
+		t.FilesRelinked++
+		t.BytesRelinked += size
+	default:
+		t.FilesWritten++
+		t.BytesWritten += size
+	}
+	return t
 }
 
 // Add accumulates other into t.
 func (t Totals) Add(other Totals) Totals {
 	return Totals{
-		FilesRemoved: t.FilesRemoved + other.FilesRemoved,
-		DirsRemoved:  t.DirsRemoved + other.DirsRemoved,
-		BytesFreed:   t.BytesFreed + other.BytesFreed,
-		Errors:       t.Errors + other.Errors,
-		Skipped:      t.Skipped + other.Skipped,
+		FilesRemoved:  t.FilesRemoved + other.FilesRemoved,
+		DirsRemoved:   t.DirsRemoved + other.DirsRemoved,
+		BytesFreed:    t.BytesFreed + other.BytesFreed,
+		FilesWritten:  t.FilesWritten + other.FilesWritten,
+		BytesWritten:  t.BytesWritten + other.BytesWritten,
+		FilesRelinked: t.FilesRelinked + other.FilesRelinked,
+		BytesRelinked: t.BytesRelinked + other.BytesRelinked,
+		Errors:        t.Errors + other.Errors,
+		Skipped:       t.Skipped + other.Skipped,
 	}
 }
 
