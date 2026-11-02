@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Everything below is the v0.1.0 scope. The tag is applied when the release
-checklist is complete.
+Nothing yet.
+
+## [0.1.0] - 2026-11-02
 
 ### Added
 
@@ -33,6 +34,8 @@ checklist is complete.
   exit-code contract.
 - CI on Linux, macOS and Windows: gofmt, vet, and the full test suite with the
   race detector.
+- A tag-triggered release pipeline: static binaries for linux, darwin and
+  windows on amd64 and arm64, archives with the docs, and `checksums.txt`.
 
 ### Notes
 
@@ -44,4 +47,4 @@ checklist is complete.
 
 | Version | Date | Scope |
 | --- | --- | --- |
-| v0.1.0 | unreleased | Engine, cleanup tasks, locking, safety ceilings, reports |
+| v0.1.0 | 2026-11-02 | Engine, cleanup tasks, locking, safety ceilings, reports |

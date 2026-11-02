@@ -1,0 +1,85 @@
+# GoReleaser configuration for tagged releases.
+#
+# Triggered by .github/workflows/release.yml on a v* tag. The result is one
+# archive per platform with the docs, plus checksums.txt so a download can be
+# verified before it is executed on a production server.
+
+version: 2
+
+project_name: cronkite
+
+builds:
+  - id: cronkite
+    main: ./cmd/cronkite
+    binary: cronkite
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Keep darwin/amd64 for Intel Macs still running servers, and skip nothing
+    # else: every combination here is a real deployment target.
+    ldflags:
+      - -s -w
+      - -X github.com/jhuancz/cronkite/internal/version.Version={{ .Version }}
+      - -X github.com/jhuancz/cronkite/internal/version.Commit={{ .Commit }}
+      - -X github.com/jhuancz/cronkite/internal/version.Date={{ .CommitDate }}
+
+archives:
+  - id: cronkite
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - cronkite.conf.example
+      - docs/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^feat'
+      order: 0
+    - title: Fixes
+      regexp: '^fix'
+      order: 1
+    - title: Documentation
+      regexp: '^docs'
+      order: 2
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^chore"
+      - "^test"
+      - "^ci"
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    **Verify before you run it.** Every archive is listed in `checksums.txt`:
+
+    ```sh
+    sha256sum -c checksums.txt --ignore-missing
+    ```

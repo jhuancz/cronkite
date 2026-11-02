@@ -59,6 +59,13 @@ it. See [docs/safety.md](docs/safety.md).
 
 ## Install
 
+Every release publishes prebuilt archives for Linux, macOS and Windows on
+amd64 and arm64, with `checksums.txt`. See the
+[releases page](https://github.com/jhuancz/cronkite/releases) and
+[docs/releasing.md](docs/releasing.md) for how to verify a download.
+
+Or let Go resolve the module:
+
 ```sh
 go install github.com/jhuancz/cronkite/cmd/cronkite@latest
 ```
