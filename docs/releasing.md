@@ -62,7 +62,9 @@ Never run a maintenance binary you have not verified, especially one that
 deletes files:
 
 Download the archive and `checksums.txt` from the release, then verify. The
-command differs by platform, and `sha256sum` does not exist on macOS:
+command differs by platform: newer macOS ships a `sha256sum` of its own, but older
+versions do not and Apple's copy exits 0 on empty input, so a mistyped archive name
+reads as a pass. Use `shasum -a 256` there:
 
 ```sh
 # Linux

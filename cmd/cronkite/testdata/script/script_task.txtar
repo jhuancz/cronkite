@@ -1,0 +1,47 @@
+# A script task rehearses with CRONKITE_DRY_RUN=1 and executes once for real.
+#
+# The rehearsal is the script's own preview: plan mode runs it, records what it
+# said, and the file it would have removed is still there. Apply then removes it.
+# Skipped on Windows because the scenario needs bash and the sample uses it.
+
+[!windows] exec bash -c 'exit 0'
+
+# The script reads its target from the inherited environment: task arguments are
+# passed to the script verbatim, so a path that varies per host belongs here.
+env LOGS=$WORK/logs
+
+cronkite plan -config cronkite.conf
+stdout 'CRONKITE_DRY_RUN=1'
+stdout 'would remove old.log'
+exists logs/old.log
+
+cronkite run -config cronkite.conf -apply
+stdout 'removed old.log'
+! exists logs/old.log
+
+-- cronkite.conf --
+version: 1
+run:
+  state_dir: $WORK/state
+tasks:
+  - name: rotate
+    type: script
+    interpreter: bash
+    file: $WORK/rotate.sh
+-- rotate.sh --
+#!/usr/bin/env bash
+# A script that honours the contract: it describes its intent when the run is a
+# rehearsal and acts only when it is not.
+set -euo pipefail
+
+log_dir=${LOGS:?the run must set LOGS}
+
+if [ "${CRONKITE_DRY_RUN}" = "1" ]; then
+	echo "would remove old.log from ${log_dir} during ${CRONKITE_MODE}"
+	exit 0
+fi
+
+rm -f -- "${log_dir}/old.log"
+echo "removed old.log from ${log_dir}"
+-- logs/old.log --
+an old log line

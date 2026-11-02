@@ -117,6 +117,10 @@ tasks:
   # --apply` runs it once with CRONKITE_DRY_RUN=0; a non-zero exit is recorded as a
   # task failure and the run continues with the next task.
   #
+  # `args` is passed to the script verbatim, like the arguments of docker run: it
+  # is not path-expanded, so per-host values belong in the environment the run
+  # inherits, not in this list.
+  #
   # See examples/maintenance.sh and examples/maintenance.ps1.
   # - name: rotate
   #   type: script
