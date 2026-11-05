@@ -198,18 +198,30 @@ func describeAPI(api apiResponse) string {
 // failures - which is what a reader acts on.
 const telegramMaxText = 4096
 
-// clampText shortens a message to the API limit, cutting on a rune boundary and
-// saying that it did.
+// clampText shortens a message to the API limit and says that it did.
+//
+// The limit is counted in characters, not bytes: counting bytes would truncate a
+// message that fits perfectly well - three thousand CJK characters are nine
+// thousand bytes and one message the API accepts - so the cut is made on runes.
 func clampText(s string) string {
-	if len(s) <= telegramMaxText {
+	if utf8.RuneCountInString(s) <= telegramMaxText {
 		return s
 	}
-	const marker = "\n... (truncated)"
-	cut := telegramMaxText - len(marker)
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	marker := "\n... (truncated)"
+	budget := telegramMaxText - utf8.RuneCountInString(marker)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	written := 0
+	for _, r := range s {
+		if written >= budget {
+			break
+		}
+		b.WriteRune(r)
+		written++
 	}
-	return s[:cut] + marker
+	b.WriteString(marker)
+	return b.String()
 }
 
 // secretError hides a token inside the message of the error it wraps. Unwrap is

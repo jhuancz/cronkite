@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jhuancz/cronkite/internal/report"
 )
@@ -223,12 +224,27 @@ func TestTokenAbsentFromEncodedReport(t *testing.T) {
 // difference between a shortened alert and no alert at all.
 func TestClampTextStopsBeforeTheAPILimit(t *testing.T) {
 	long := strings.Repeat("a failed task name; ", 400)
-	if len(long) <= telegramMaxText {
-		t.Fatalf("the fixture must exceed the limit, it is %d bytes", len(long))
+	if utf8.RuneCountInString(long) <= telegramMaxText {
+		t.Fatalf("the fixture must exceed the limit, it is %d runes", utf8.RuneCountInString(long))
 	}
 	got := clampText(long)
-	if len(got) > telegramMaxText {
-		t.Fatalf("clamped text is %d bytes, above the %d limit", len(got), telegramMaxText)
+	if utf8.RuneCountInString(got) > telegramMaxText {
+		t.Fatalf("clamped text is %d runes, above the %d limit", utf8.RuneCountInString(got), telegramMaxText)
+	}
+
+	// The limit is characters, not bytes: a message of wide characters that fits
+	// the API must not be truncated just because its UTF-8 form is long.
+	cjk := strings.Repeat("任", 3000)
+	if utf8.RuneCountInString(cjk) <= telegramMaxText/2 {
+		t.Fatalf("the fixture should be under the character limit but wide: %d runes, %d bytes",
+			utf8.RuneCountInString(cjk), len(cjk))
+	}
+	if got := clampText(cjk); got != cjk {
+		t.Fatalf("a message of %d runes must not be truncated, got %d runes",
+			utf8.RuneCountInString(cjk), utf8.RuneCountInString(got))
+	}
+	if got := clampText(strings.Repeat("任", telegramMaxText+100)); utf8.RuneCountInString(got) > telegramMaxText {
+		t.Fatalf("a wide message over the limit must still be clamped, got %d runes", utf8.RuneCountInString(got))
 	}
 	if !strings.HasSuffix(got, "(truncated)") || !strings.HasPrefix(got, "a failed task name;") {
 		t.Fatalf("the clamp must keep the beginning and say it cut: %q", got[len(got)-40:])
